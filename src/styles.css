@@ -1102,3 +1102,172 @@ table.data.meta tbody th {
 .tooltip-row span:last-child {
   color: var(--text-secondary);
 }
+
+/* ---- simple mode: the photo alone ------------------------------------------ */
+
+#app[data-mode='simple'] .topbar,
+#app[data-mode='simple'] .workspace,
+#app[data-mode='advanced'] .simple,
+#app[data-mode='advanced'] .advanced-toggle {
+  display: none;
+}
+
+#app[data-mode='simple'] main {
+  padding: 0;
+}
+
+#app[data-mode='simple'] .empty {
+  min-height: 100vh;
+}
+
+#app[data-mode='simple'] .dropzone {
+  gap: 14px;
+  width: min(420px, 100% - 32px);
+  padding: 64px 32px;
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+}
+
+.drop-text {
+  font-size: 15px;
+  color: var(--text-secondary);
+}
+
+.simple {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: var(--page);
+}
+
+.simple-figure {
+  position: relative;
+  margin: 0;
+  line-height: 0;
+}
+
+.simple-canvas {
+  display: block;
+  width: min(calc(100vw - 64px), calc((100vh - 64px) * var(--aspect, 1.5)));
+  height: auto;
+  border-radius: 3px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+  transition: opacity 600ms ease, filter 600ms ease;
+}
+
+.simple-canvas.pending {
+  opacity: 0.3;
+  filter: blur(10px) saturate(0.4);
+}
+
+body.dragging .simple-canvas {
+  outline: 2px solid var(--accent);
+  outline-offset: 6px;
+}
+
+.simple-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  height: 2px;
+}
+
+.simple-progress span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--accent);
+  transition: width 300ms ease;
+}
+
+.simple-message {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 24px;
+  margin: 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.simple-message:empty {
+  display: none;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(18, 18, 18, 0.6);
+  color: var(--text-primary);
+  backdrop-filter: blur(12px);
+  cursor: pointer;
+  transition: opacity 200ms ease, background 200ms ease;
+}
+
+.icon-button:hover {
+  background: rgba(44, 44, 44, 0.85);
+}
+
+.icon-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.icon-button.flat {
+  width: 32px;
+  height: 32px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.icon-button.flat:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+
+.advanced-toggle {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 40;
+  opacity: 0.5;
+}
+
+.advanced-toggle:hover,
+.advanced-toggle:focus-visible {
+  opacity: 1;
+}
+
+.download {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  opacity: 0;
+}
+
+.simple-figure:hover .download,
+.download:focus-visible,
+.download.busy {
+  opacity: 1;
+}
+
+.download:disabled {
+  cursor: progress;
+}
+
+@media (hover: none) {
+  .download {
+    opacity: 0.85;
+  }
+}

@@ -131,7 +131,7 @@ function fineDetail(rgba: Uint8ClampedArray, w: number, x0: number, y0: number, 
 }
 
 test('the full-resolution render matches the look it is built on and adds the fine detail', () => {
-  const { img, small, base, job } = setup(null, false);
+  const { img, small, job } = setup(null, false);
   assert.equal(job.width, W);
   assert.equal(job.height, H);
   const full = renderRows(job, demosaicSource({ ...img, offset: 0 }, wb), 0, job.height);

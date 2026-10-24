@@ -1,15 +1,16 @@
-// Bracket inspector UI: open a set of ARW files, decode them in a worker, and
-// show per-frame statistics, the measured exposure ratios, the noise model and
-// the merged HDR result.
+// The app UI. By default it is just the finished photo: drop a bracket, watch
+// it come together, download it. One button opens the workspace behind it —
+// the frames, measured exposure ratios, noise model, merge checks and the look
+// controls.
 
 import type { ExposureAnalysis, FrameExposure, PairRatio } from '../analysis/exposure.ts';
 import type { NoiseModel } from '../analysis/noise.ts';
 import type { PreviewData } from '../analysis/preview.ts';
 import type { FrameStats } from '../analysis/stats.ts';
-import type { ExportSize, FrameInfo, LensInfo, LookSettings, MergeSummary, UprightInfo, WbSetting, WorkerEvent, WorkerRequest } from '../worker/protocol.ts';
+import type { ExportSize, FrameInfo, LensInfo, LookDetail, LookSettings, MergeSummary, UprightInfo, WbSetting, WorkerEvent, WorkerRequest } from '../worker/protocol.ts';
 import type { DemosaicAlgorithm, Rect } from '../demosaic/demosaic.ts';
 import { REAL_ESTATE_LOOK } from '../look/defaults.ts';
-import { h, replace } from './dom.ts';
+import { h, replace, s as svg } from './dom.ts';
 import * as fmt from './format.ts';
 import { evHistogram, histogramChart, type EvHistogram } from './histogram.ts';
 import { lineChart } from './line-chart.ts';
@@ -62,6 +63,41 @@ const FRAME_COLORS: ReadonlyArray<readonly [number, number, number]> = [
 const GHOST_COLORS: ReadonlyArray<readonly [number, number, number]> = [[0xe0, 0x3c, 0x9a]];
 const css = (c: readonly [number, number, number]): string => `rgb(${c[0]} ${c[1]} ${c[2]})`;
 
+/** A 24 × 24 stroked line icon. */
+const icon = (...paths: string[]): SVGSVGElement =>
+  svg(
+    'svg',
+    { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.8, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' },
+    ...paths.map((d) => svg('path', { d })),
+  );
+const ICON_DOWNLOAD = ['M12 4v11', 'M7.5 10.5 12 15l4.5-4.5', 'M5 19.5h14'];
+const ICON_ADVANCED = ['M4 7h9', 'M17 7h3', 'M15 5v4', 'M4 17h3', 'M11 17h9', 'M9 15v4'];
+const ICON_CLOSE = ['M6 6l12 12', 'M18 6 6 18'];
+const ICON_DONE = ['M5 12.5 10 17 19 7'];
+
+/** A circular progress indicator for the download button. */
+function progressRing(fraction: number): SVGSVGElement {
+  const r = 8;
+  const c = 2 * Math.PI * r;
+  return svg(
+    'svg',
+    { viewBox: '0 0 24 24', width: 20, height: 20, 'aria-hidden': 'true', class: 'ring' },
+    svg('circle', { cx: 12, cy: 12, r, fill: 'none', stroke: 'currentColor', 'stroke-opacity': 0.25, 'stroke-width': 2 }),
+    svg('circle', {
+      cx: 12,
+      cy: 12,
+      r,
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': 2,
+      'stroke-linecap': 'round',
+      'stroke-dasharray': c.toFixed(2),
+      'stroke-dashoffset': (c * (1 - Math.max(0.04, fraction))).toFixed(2),
+      transform: 'rotate(-90 12 12)',
+    }),
+  );
+}
+
 export function startApp(root: HTMLElement): void {
   new App(root);
 }
@@ -105,7 +141,7 @@ class App {
   private lookInfo: { profile: string; wb: { auto: WbSetting & { coverage: number }; asShot: WbSetting; camera: WbSetting | null }; upright: UprightInfo; lens: LensInfo } | null = null;
   private lookSettings: LookSettings | null = null;
   private wbMode: WbMode = 'auto';
-  private lookImage: { id: number; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; sizes: Record<ExportSize, [number, number]>; ms: number } | null = null;
+  private lookImage: { id: number; detail: LookDetail; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; sizes: Record<ExportSize, [number, number]>; ms: number } | null = null;
   private lookRequest = 0;
   private lookTimer = 0;
   private lookError = '';
@@ -115,7 +151,12 @@ class App {
   private exportStatus = '';
   private exportBusy = false;
   private exportSize: ExportSize = 'full';
+  private exportDone = 0;
+  private exportProgress = 0;
   private showGhosts = false;
+  /** Simple (just the photo) or advanced (the whole workspace). */
+  private advanced = false;
+  private displayTimer = 0;
 
   private readonly input = h('input', { id: 'file-input', type: 'file', accept: '.arw,.ARW', multiple: true, hidden: true, 'data-testid': 'file-input' });
   private readonly status = h('div', { class: 'status', role: 'status', 'data-testid': 'status' });
@@ -134,6 +175,12 @@ class App {
   private readonly noisePanel = h('section', { class: 'panel', 'data-testid': 'noise-panel' });
   private readonly mergePanel = h('section', { class: 'panel', 'data-testid': 'merge-panel' });
   private readonly metadataPanel = h('section', { class: 'panel', 'data-testid': 'metadata-panel' });
+  private readonly simple = h('section', { class: 'simple', 'data-testid': 'simple', hidden: true });
+  private readonly simpleCanvas = h('canvas', { class: 'simple-canvas pending', 'data-testid': 'simple-canvas', role: 'img', 'aria-label': 'The finished photo' });
+  private readonly simpleProgress = h('div', { class: 'simple-progress', hidden: true }, h('span'));
+  private readonly simpleMessage = h('p', { class: 'simple-message', role: 'status' });
+  private readonly downloadButton = h('button', { type: 'button', class: 'icon-button download', 'aria-label': 'Download the full-resolution JPEG', title: 'Download (full resolution JPEG)', 'data-testid': 'download', hidden: true });
+  private readonly advancedButton = h('button', { type: 'button', class: 'icon-button advanced-toggle', 'aria-label': 'Show the workspace', title: 'Details and controls', 'data-testid': 'advanced-toggle', hidden: true }, icon(...ICON_ADVANCED));
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -186,6 +233,8 @@ class App {
     this.picking = false;
     this.exportStatus = '';
     this.exportBusy = false;
+    this.exportProgress = 0;
+    this.exportDone = 0;
     this.showGhosts = false;
     this.selected = -1;
     this.matched = false;
@@ -198,6 +247,7 @@ class App {
     const request: WorkerRequest = { type: 'open', files: arw };
     this.worker.postMessage(request);
     this.renderAll();
+    this.renderSimple();
   }
 
   private onWorkerEvent(ev: WorkerEvent): void {
@@ -224,6 +274,7 @@ class App {
         Object.assign(slot, { info: ev.info, stats: ev.stats, preview: ev.preview, ms: ev.ms, hist: evHistogram(ev.stats, ev.info) });
         if (this.selected === -1) this.selected = ev.index;
         this.renderAll();
+        this.renderSimple();
         break;
       }
       case 'frame-error':
@@ -235,6 +286,7 @@ class App {
         this.selected = this.exposures.reference;
         this.gainCache = null;
         this.renderAll();
+        this.renderSimple();
         break;
       case 'exposures-error':
         this.exposureError = ev.message;
@@ -259,6 +311,7 @@ class App {
       case 'merge-error':
         this.mergeError = ev.message;
         this.renderAll();
+        this.renderSimple();
         break;
       case 'crop':
         if (ev.id !== this.cropRequest) break; // superseded by a newer request
@@ -289,19 +342,23 @@ class App {
       case 'look':
         if (!this.lookImage || ev.id >= this.lookImage.id) {
           const first = !this.lookImage;
-          this.lookImage = { id: ev.id, width: ev.width, height: ev.height, rgba: ev.rgba, exposures: ev.exposures, sizes: ev.sizes, ms: ev.ms };
+          this.lookImage = { id: ev.id, detail: ev.detail, width: ev.width, height: ev.height, rgba: ev.rgba, exposures: ev.exposures, sizes: ev.sizes, ms: ev.ms };
           this.lookError = '';
           if (first) this.renderToolbar(); // enables Export
           else this.refreshExportSizes();
           this.renderImages();
           this.renderLookStatus();
+          this.renderSimple();
+          if (ev.detail === 'display' && ev.id === this.lookRequest) this.requestSharp();
         }
         break;
       case 'export-progress':
         if (ev.id === this.exportRequest && this.exportBusy) {
+          this.exportProgress = ev.fraction;
           this.exportStatus = `Rendering full detail… ${Math.round(100 * ev.fraction)}%`;
           const note = this.toolbar.querySelector('[data-testid="export-status"]');
           if (note) note.textContent = this.exportStatus;
+          if (!this.advanced) this.renderSimple();
         }
         break;
       case 'export': {
@@ -314,9 +371,13 @@ class App {
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
         this.exportBusy = false;
+        this.exportDone = performance.now();
         const what = ev.format === 'dng' ? 'float DNG' : 'JPEG';
         this.exportStatus = `Exported ${ev.width} × ${ev.height} ${what} (${fmt.megabytes(ev.blob.size)}) in ${(ev.ms / 1000).toFixed(1)} s`;
+        this.downloadButton.dataset.exported = `${ev.width}x${ev.height}`;
         this.renderToolbar();
+        this.renderSimple();
+        setTimeout(() => this.renderSimple(), 1900); // the check mark gives way to the download icon
         break;
       }
       case 'neutral-picked':
@@ -334,6 +395,7 @@ class App {
         } else this.lookError = ev.message;
         this.renderToolbar();
         this.renderLookStatus();
+        this.renderSimple();
         break;
       case 'done': {
         this.totalMs = performance.now() - this.startedAt;
@@ -342,6 +404,7 @@ class App {
         const what = this.merge ? `${ok} frames decoded and merged` : `${ok} frame${ok === 1 ? '' : 's'} decoded`;
         this.renderStatus(`${what} in ${(this.totalMs / 1000).toFixed(1)} s${failed ? ` · ${failed} failed` : ''}`);
         this.renderSummary();
+        this.renderSimple();
         break;
       }
     }
@@ -357,7 +420,11 @@ class App {
       h('div', { class: 'brand' }, logo, h('div', {}, h('h1', {}, 'HDR Merger'), h('p', {}, 'Bracket merge · Sony A7C II ARW'))),
       h('div', { class: 'status-wrap' }, this.status, h('div', { class: 'progress' }, this.progressBar)),
       h('label', { class: 'button primary', for: 'file-input' }, 'Open ARW files'),
-      this.input,
+      h(
+        'button',
+        { type: 'button', class: 'icon-button flat', 'aria-label': 'Back to the photo', title: 'Back to the photo', 'data-testid': 'simple-toggle', onclick: () => this.setAdvanced(false) },
+        icon(...ICON_CLOSE),
+      ),
     );
     const viewer = h('div', { class: 'viewer-panel' }, this.toolbar, h('div', { class: 'viewer' }, this.canvas), this.viewerCaption);
     replace(
@@ -371,7 +438,23 @@ class App {
       this.noisePanel,
       this.metadataPanel,
     );
-    replace(this.root, header, h('main', {}, this.empty, this.workspace));
+    this.downloadButton.addEventListener('click', () => {
+      this.exportSize = 'full';
+      this.exportLook('jpeg');
+    });
+    this.advancedButton.addEventListener('click', () => this.setAdvanced(true));
+    replace(this.simple, this.simpleProgress, h('figure', { class: 'simple-figure' }, this.simpleCanvas, this.downloadButton), this.simpleMessage);
+    replace(this.root, this.input, header, h('main', {}, this.empty, this.workspace), this.simple, this.advancedButton);
+    this.root.dataset.mode = 'simple';
+  }
+
+  /** Switches between the photo alone and the full workspace. */
+  private setAdvanced(on: boolean): void {
+    this.advanced = on;
+    this.root.dataset.mode = on ? 'advanced' : 'simple';
+    window.scrollTo(0, 0);
+    if (on) this.renderAll();
+    else this.renderSimple();
   }
 
   private renderEmpty(): void {
@@ -379,20 +462,58 @@ class App {
       this.empty,
       h(
         'label',
-        { class: 'dropzone', for: 'file-input' },
+        { class: 'dropzone', for: 'file-input', 'data-testid': 'dropzone-label' },
         h('span', { class: 'drop-icon', 'aria-hidden': 'true' }, h('span'), h('span'), h('span')),
-        h('strong', {}, 'Drop a bracket set here'),
-        h('span', {}, 'or click to choose the ARW files of one bracket'),
-        h('span', { class: 'hint' }, 'Sony A7C II · RAW file type Uncompressed · tripod · decoded locally in your browser'),
+        h('span', { class: 'drop-text' }, 'Drop your ARW bracket'),
       ),
     );
+  }
+
+  /**
+   * The photo alone: while the bracket is processed, the base frame dimmed
+   * under a thin progress line; then the finished look, with a download button
+   * on hover.
+   */
+  private renderSimple(): void {
+    const loaded = this.slots.length > 0;
+    this.simple.hidden = !loaded;
+    this.advancedButton.hidden = !loaded;
+    if (!loaded) return;
+    const failed = this.mergeError || this.exposureError || (this.slots.every((s) => s.error) ? this.slots[0].error : '');
+    const img = this.lookImage;
+    if (img) {
+      this.drawLook(this.simpleCanvas);
+      this.simpleCanvas.style.setProperty('--aspect', String(img.width / img.height));
+      this.simpleCanvas.classList.remove('pending');
+      this.simpleCanvas.dataset.state = 'final';
+    } else {
+      const slot = this.referenceSlot();
+      if (slot?.preview && slot.info) {
+        this.draw(this.simpleCanvas, slot.preview, { gain: this.gainFor(slot), wb: wbGains(slot.info), showClipping: false, tone: 'global' });
+        this.simpleCanvas.style.setProperty('--aspect', String(slot.preview.width / slot.preview.height));
+        this.simpleCanvas.dataset.state = 'pending';
+      }
+      this.simpleCanvas.classList.add('pending');
+    }
+    this.simpleCanvas.hidden = !img && !this.referenceSlot()?.preview;
+    this.downloadButton.hidden = !img;
+    this.downloadButton.disabled = this.exportBusy;
+    this.downloadButton.classList.toggle('busy', this.exportBusy);
+    const justDone = performance.now() - this.exportDone < 1800;
+    replace(this.downloadButton, this.exportBusy ? progressRing(this.exportProgress) : icon(...(justDone ? ICON_DONE : ICON_DOWNLOAD)));
+    this.simpleMessage.textContent = failed ? `Could not merge these files: ${failed}` : this.exportStatus.startsWith('Export failed') ? this.exportStatus : '';
   }
 
   private renderStatus(text: string, progress?: number): void {
     this.status.textContent = text;
     const bar = this.progressBar.parentElement as HTMLElement;
     bar.hidden = progress === undefined;
-    if (progress !== undefined) this.progressBar.style.width = `${Math.round(progress * 100)}%`;
+    this.simpleProgress.hidden = progress === undefined;
+    if (progress !== undefined) {
+      this.progressBar.style.width = `${Math.round(progress * 100)}%`;
+      (this.simpleProgress.firstElementChild as HTMLElement).style.width = `${Math.round(progress * 100)}%`;
+    }
+    this.simpleProgress.setAttribute('aria-label', text);
   }
 
   private bindDragAndDrop(): void {
@@ -418,6 +539,11 @@ class App {
     window.addEventListener('keydown', (e) => {
       const target = e.target as HTMLElement;
       if (target.closest('input, select, textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 'Escape' && this.advanced) {
+        this.setAdvanced(false);
+        return;
+      }
+      if (!this.advanced) return;
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         const order = this.navigationOrder();
         const at = order.indexOf(this.selected);
@@ -554,13 +680,30 @@ class App {
   }
 
   /** Asks the worker for the finished look with the current settings, debounced for slider drags. */
+  /** On a screen with more pixels than the display render, follows it with a half-resolution render with full detail. */
+  private requestSharp(): void {
+    const img = this.lookImage;
+    if (!img || !this.worker || !this.lookSettings) return;
+    // The photo's on-screen width in device pixels, in the simple view (the workspace viewer is smaller).
+    const cssWidth = Math.min(window.innerWidth - 64, (window.innerHeight - 64) * (img.width / img.height));
+    if (cssWidth * window.devicePixelRatio < 1.15 * img.width) return;
+    const request: WorkerRequest = { type: 'look', id: ++this.lookRequest, settings: this.lookSettings, detail: 'sharp' };
+    this.worker.postMessage(request);
+  }
+
+  /** A quick preview render now, and a sharp one once the settings have stopped changing. */
   private requestLook(delay = 90): void {
     clearTimeout(this.lookTimer);
-    this.lookTimer = window.setTimeout(() => {
+    clearTimeout(this.displayTimer);
+    const send = (detail: LookDetail): void => {
       if (!this.worker || !this.lookSettings) return;
-      const request: WorkerRequest = { type: 'look', id: ++this.lookRequest, settings: this.lookSettings };
+      const request: WorkerRequest = { type: 'look', id: ++this.lookRequest, settings: this.lookSettings, detail };
       this.worker.postMessage(request);
       this.renderLookStatus();
+    };
+    this.lookTimer = window.setTimeout(() => {
+      send('preview');
+      this.displayTimer = window.setTimeout(() => send('display'), 700);
     }, delay);
   }
 
@@ -571,8 +714,10 @@ class App {
       format === 'dng' ? { type: 'export-dng', id, settings: this.lookSettings } : { type: 'export', id, settings: this.lookSettings, size: this.exportSize };
     this.worker.postMessage(request);
     this.exportBusy = true;
+    this.exportProgress = 0;
     this.exportStatus = format === 'dng' ? 'Writing the DNG…' : this.exportSize === 'small' ? 'Rendering…' : 'Rendering full detail…';
     this.renderToolbar();
+    this.renderSimple();
   }
 
   /** The real-estate default look for this image. */
@@ -612,7 +757,7 @@ class App {
         ? 'Rendering…'
         : pending
           ? 'Updating…'
-          : `${this.lookImage.width} × ${this.lookImage.height} preview in ${Math.round(this.lookImage.ms)} ms · fused ${this.lookImage.exposures.length} synthetic exposures`;
+          : `${this.lookImage.width} × ${this.lookImage.height} ${this.lookImage.detail} in ${Math.round(this.lookImage.ms)} ms · fused ${this.lookImage.exposures.length} synthetic exposures`;
   }
 
   private renderAll(): void {

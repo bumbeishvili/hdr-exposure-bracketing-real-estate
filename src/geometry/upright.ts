@@ -199,11 +199,6 @@ export function geometryWarp(rotation: Matrix3 | null, lens: LensModel | null, w
   return { inverse: mulMM(Hinv, toPlane), width, height, sourceWidth: w, sourceHeight: h, scale: s, lens };
 }
 
-/** Upright only (kept for callers without a lens model). */
-export function uprightWarp(rotation: Matrix3, w: number, h: number, focal: number): UprightWarp {
-  return geometryWarp(rotation, null, w, h, focal);
-}
-
 /** Sensor position (continuous, pixel edges at integers) of plane point (px, py) under the warp's lens. */
 function sensorPosition(warp: UprightWarp, px: number, py: number, channel: number): [number, number] {
   const z = mul3(warp.inverse, [px, py, 1]);

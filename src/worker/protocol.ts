@@ -67,6 +67,13 @@ export interface LensInfo {
   ca: number;
 }
 
+/**
+ * How finely a look render is made: 'preview' at an eighth of the sensor's
+ * linear size (quick, for dragging sliders), 'display' at a quarter, 'sharp'
+ * at half with full-resolution detail (for high-density screens).
+ */
+export type LookDetail = 'preview' | 'display' | 'sharp';
+
 /** JPEG export sizes: full sensor resolution, half, or the quarter-size render itself. */
 export type ExportSize = 'full' | 'half' | 'small';
 
@@ -84,8 +91,8 @@ export type WorkerRequest =
   | { type: 'open'; files: File[] }
   /** Demosaic part of the merged image at full resolution. */
   | { type: 'crop'; id: number; rect: Rect; algorithm: DemosaicAlgorithm; wb: [number, number, number] }
-  /** Render the finished look at preview size; only the newest pending request is rendered. */
-  | { type: 'look'; id: number; settings: LookSettings }
+  /** Render the finished look; only the newest pending request is rendered. */
+  | { type: 'look'; id: number; settings: LookSettings; detail: LookDetail }
   /** Render the finished look at export size and encode a JPEG. */
   | { type: 'export'; id: number; settings: LookSettings; size: ExportSize }
   /** Write the merged raw data as a floating-point DNG (white balance from `settings`). */
@@ -114,7 +121,7 @@ export type WorkerEvent =
   /** The look stage is ready: white balance candidates, and the camera profile in use. */
   | { type: 'look-ready'; profile: string; wb: { auto: WbSetting & { coverage: number }; asShot: WbSetting; camera: WbSetting | null }; upright: UprightInfo; lens: LensInfo }
   /** `sizes`: pixel size of each export size under these settings. */
-  | { type: 'look'; id: number; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; windowShare: number; sizes: Record<ExportSize, [number, number]>; ms: number }
+  | { type: 'look'; id: number; detail: LookDetail; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; windowShare: number; sizes: Record<ExportSize, [number, number]>; ms: number }
   | { type: 'export-progress'; id: number; fraction: number }
   | { type: 'export'; id: number; format: 'jpeg' | 'dng'; blob: Blob; width: number; height: number; ms: number }
   | { type: 'neutral-picked'; wb: WbSetting }

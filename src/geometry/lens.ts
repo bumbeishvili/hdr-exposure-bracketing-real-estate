@@ -61,10 +61,3 @@ export function devignette(rgb: Float32Array, w: number, h: number, model: LensM
     }
   }
 }
-
-/** Largest radial scale over the field: how far beyond the frame the correction reaches. */
-export function maxRadialScale(model: LensModel): number {
-  let m = 1;
-  for (let k = 0; k <= 100; k++) for (let c = 0; c < 3; c++) m = Math.max(m, radialScale(model, k / 100, c));
-  return m;
-}

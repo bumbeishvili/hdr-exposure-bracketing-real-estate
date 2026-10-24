@@ -23,7 +23,7 @@ import { exifSegment, insertSegment, type ExifInfo } from '../raw/jpeg-exif.ts';
 import { renderPool } from './render-pool.ts';
 import type { Matrix3 } from '../color/dcp.ts';
 import profileUrl from '../color/profiles/Sony ILCE-7M4 Adobe Standard.dcp?url';
-import type { ExportSize, LensInfo, LookSettings, WbSetting } from './protocol.ts';
+import type { ExportSize, LensInfo, LookDetail, LookSettings, WbSetting } from './protocol.ts';
 import { makePreview } from '../analysis/preview.ts';
 import type { FrameInfo, WorkerEvent, WorkerRequest } from './protocol.ts';
 
@@ -41,7 +41,9 @@ let merged: MergedImage | null = null;
 let lookPreview: RgbImage | null = null;
 let lookExport: RgbImage | null = null;
 let profilePromise: Promise<CameraProfile> | null = null;
-let pendingLook: { id: number; settings: LookSettings } | null = null;
+let pendingLook: { id: number; settings: LookSettings; detail: LookDetail } | null = null;
+/** The last display render's coarse levels, reused by an export with the same settings. */
+let displayBase: { key: string; base: LookBase } | null = null;
 let lookScheduled = false;
 /** Upright: the rotation that straightens verticals, and the 35 mm-equivalent focal length it assumes. */
 let uprightRotation: Matrix3 | null = null;
@@ -97,15 +99,38 @@ async function renderPendingLook(): Promise<void> {
   lookScheduled = false;
   const req = pendingLook;
   pendingLook = null;
-  if (!req || !lookPreview) return;
+  if (!req || !lookPreview || !merged) return;
   try {
     const t0 = performance.now();
     const profile = await loadProfile();
-    const { width, height, rgb } = working(lookPreview, req.settings);
-    const out = renderLook(rgb, width, height, profile, { ...req.settings, neutral: neutralForTemperature(profile, req.settings.wb.temperature, req.settings.wb.tint) });
-    const rgba = new Uint8ClampedArray(width * height * 4);
-    toRgba8(out.rgb, rgba);
-    post({ type: 'look', id: req.id, width, height, rgba, exposures: out.exposures, windowShare: out.windowShare, sizes: exportSizes(req.settings), ms: performance.now() - t0 }, [rgba.buffer]);
+    const settings = req.settings;
+    const neutral = neutralForTemperature(profile, settings.wb.temperature, settings.wb.tint);
+    const key = JSON.stringify(settings);
+    let image: { width: number; height: number; rgba: Uint8ClampedArray };
+    let exposures: number[];
+    let windowShare = 0;
+    let detail = req.detail;
+    if (detail === 'sharp' && displayBase?.key === key) {
+      // Half resolution with full-resolution detail, on the render workers; the pipeline thread stays free for previews.
+      image = await renderDetailed(merged, displayBase.base, settings, profile, neutral, 'half', () => {});
+      exposures = displayBase.base.exposures;
+    } else {
+      const display = detail !== 'preview';
+      if (display) detail = 'display'; // a sharp render needs this one first
+      if (display) lookExport ??= binMerged(merged, 2);
+      const { width, height, rgb } = working(display ? lookExport! : lookPreview, settings);
+      const out = renderLook(rgb, width, height, profile, { ...settings, neutral }, display);
+      // The display render is also the base of sharp renders and exports with the same settings.
+      if (display && out.base) displayBase = { key, base: out.base };
+      image = { width, height, rgba: new Uint8ClampedArray(width * height * 4) };
+      toRgba8(out.rgb, image.rgba);
+      exposures = out.exposures;
+      windowShare = out.windowShare;
+    }
+    post(
+      { type: 'look', id: req.id, detail, ...image, exposures, windowShare, sizes: exportSizes(settings), ms: performance.now() - t0 },
+      [image.rgba.buffer],
+    );
   } catch (err) {
     post({ type: 'look-error', id: req.id, message: errorText(err) });
   }
@@ -131,15 +156,20 @@ async function exportJpeg(id: number, settings: LookSettings, size: ExportSize):
     const t0 = performance.now();
     const profile = await loadProfile();
     const neutral = neutralForTemperature(profile, settings.wb.temperature, settings.wb.tint);
-    lookExport ??= binMerged(merged, 2);
-    const work = working(lookExport, settings);
-    const look = renderLook(work.rgb, work.width, work.height, profile, { ...settings, neutral }, size !== 'small');
     let image: { width: number; height: number; rgba: Uint8ClampedArray };
-    if (size === 'small' || !look.base) {
-      image = { width: work.width, height: work.height, rgba: new Uint8ClampedArray(work.width * work.height * 4) };
-      toRgba8(look.rgb, image.rgba);
+    const reuse = displayBase?.key === JSON.stringify(settings) ? displayBase.base : null;
+    if (reuse && size !== 'small') {
+      image = await renderDetailed(merged, reuse, settings, profile, neutral, size, (fraction) => post({ type: 'export-progress', id, fraction }));
     } else {
-      image = await renderDetailed(merged, look.base, settings, profile, neutral, size, (fraction) => post({ type: 'export-progress', id, fraction }));
+      lookExport ??= binMerged(merged, 2);
+      const work = working(lookExport, settings);
+      const look = renderLook(work.rgb, work.width, work.height, profile, { ...settings, neutral }, size !== 'small');
+      if (size === 'small' || !look.base) {
+        image = { width: work.width, height: work.height, rgba: new Uint8ClampedArray(work.width * work.height * 4) };
+        toRgba8(look.rgb, image.rgba);
+      } else {
+        image = await renderDetailed(merged, look.base, settings, profile, neutral, size, (fraction) => post({ type: 'export-progress', id, fraction }));
+      }
     }
     const canvas = new OffscreenCanvas(image.width, image.height);
     canvas.getContext('2d')!.putImageData(new ImageData(image.rgba as Uint8ClampedArray<ArrayBuffer>, image.width, image.height), 0, 0);
@@ -341,6 +371,7 @@ async function prepareLook(reference: RawFrame): Promise<void> {
   if (!merged) return;
   lookPreview = binMerged(merged, 4);
   lookExport = null;
+  displayBase = null;
   const profile = await loadProfile();
   const auto = estimateInteriorWhiteBalance(profile, lookPreview.rgb);
   const asShot = withTemperature(profile, reference.asShotWb ? neutralFromLevels(reference.asShotWb) : auto.neutral, 0);

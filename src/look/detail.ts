@@ -57,7 +57,7 @@ export function renderRows(job: DetailJob, source: RowSource, v0: number, v1: nu
 }
 
 /** Display-referred linear sRGB for output rows [b0, b1). */
-export function renderBand(job: DetailJob, source: RowSource, b0: number, b1: number): Float32Array {
+function renderBand(job: DetailJob, source: RowSource, b0: number, b1: number): Float32Array {
   const { width: W, height: H, factor: F } = job;
   // The band plus a margin of one coarse group on each side, aligned to the coarsest grid.
   const e0 = Math.max(0, b0 - F);
@@ -258,7 +258,7 @@ function cubic(t: number, w: Float64Array): void {
 }
 
 /** Sensor rows [y0, y1) a band of output rows reads, from the warp along the band's outline. */
-export function sourceRowsFor(warp: UprightWarp, e0: number, e1: number): [number, number] {
+function sourceRowsFor(warp: UprightWarp, e0: number, e1: number): [number, number] {
   let lo = Infinity;
   let hi = -Infinity;
   const probe = (u: number, v: number): void => {
