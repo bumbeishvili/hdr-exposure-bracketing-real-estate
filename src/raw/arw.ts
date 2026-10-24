@@ -98,7 +98,9 @@ export interface Sr2Block {
   offset: number;
   length: number;
   key: number;
-  /** Numeric tags of the decrypted SR2SubIFD. */
+  /** Entries in the decrypted SR2SubIFD. */
+  entryCount: number;
+  /** Numeric tags of the decrypted SR2SubIFD (up to 256 values each). */
   tags: ReadonlyMap<number, number[]>;
 }
 
@@ -388,5 +390,5 @@ function readSr2(r: TiffReader, bytes: Uint8Array, ifd0: Ifd): Sr2Block | null {
   for (const [tag, entry] of sub.entries) {
     if (entry.type !== 2 && entry.type !== 7 && entry.count <= 256) tags.set(tag, sr.values(entry));
   }
-  return { offset, length, key, tags };
+  return { offset, length, key, entryCount: sub.count, tags };
 }

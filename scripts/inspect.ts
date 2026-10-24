@@ -6,6 +6,7 @@ import { basename } from 'node:path';
 import { readArw } from '../src/raw/arw.ts';
 import { computeFrameStats } from '../src/analysis/stats.ts';
 import { analyzeExposures, linearLimit } from '../src/analysis/exposure.ts';
+import { fitNoiseModel } from '../src/analysis/noise.ts';
 
 const paths = process.argv.slice(2);
 if (!paths.length) {
@@ -55,5 +56,30 @@ for (const p of analysis.pairs) {
   const line = p.estimate.linearity.map((b) => `${b.level.toFixed(2)}:${b.relative.toFixed(3)}`).join(' ');
   console.log(`  ${frames[p.bright].fileName}: ${line}`);
 }
+const t4 = performance.now();
+const noise = fitNoiseModel(frames, analysis);
+const t5 = performance.now();
 console.log('');
-console.log(`decode ${(t1 - t0).toFixed(0)} ms · stats ${(t2 - t1).toFixed(0)} ms · ratios ${(t3 - t2).toFixed(0)} ms`);
+console.log(`noise model, Var(v) = alpha·(1 + ${noise.timeSlope.toFixed(3)}·log2(t / ${noise.referenceTime.toFixed(3)} s))·s + beta (flat pixels, all pairs jointly):`);
+const range = f0.whiteLevel - f0.blackLevel[0];
+for (const c of noise.channels) {
+  const gain = 1 / c.alpha;
+  const read = Math.sqrt(c.beta);
+  console.log(
+    `  ${c.name.padEnd(3)} alpha ${c.alpha.toFixed(4)} DN²/DN → gain ${gain.toFixed(2)} e-/DN · read noise ${read.toFixed(2)} DN (${(read * gain).toFixed(1)} e-) · full well ${Math.round(range * gain)} e- · DR ${Math.log2(range / read).toFixed(1)} stops`,
+  );
+}
+console.log('');
+console.log('pair residual check (measured ÷ predicted variance per signal bin, flat pixels):');
+for (const p of noise.pairs) {
+  const ratios = p.bins.flat().map((b) => b.measured / b.predicted);
+  const sorted = [...ratios].sort((a, b) => a - b);
+  const med = sorted[sorted.length >> 1];
+  console.log(
+    `  ${frames[p.bright].fileName} / ${frames[p.dark].fileName}: median ${med.toFixed(3)} · range ${sorted[0].toFixed(3)}–${sorted[sorted.length - 1].toFixed(3)} · ${ratios.length} bins · flat ${(100 * p.flatFraction).toFixed(0)}% · black offset ${p.blackOffset.map((d) => d.toFixed(2)).join('/')} DN`,
+  );
+}
+const g1 = noise.pairs[1].bins[1];
+console.log(`  detail ${frames[noise.pairs[1].bright].fileName} G1: ` + g1.filter((_, i) => i % 3 === 0).map((b) => `${b.signal.toFixed(0)}:${(b.measured / b.predicted).toFixed(2)}`).join(' '));
+console.log('');
+console.log(`decode ${(t1 - t0).toFixed(0)} ms · stats ${(t2 - t1).toFixed(0)} ms · ratios ${(t3 - t2).toFixed(0)} ms · noise ${(t5 - t4).toFixed(0)} ms`);

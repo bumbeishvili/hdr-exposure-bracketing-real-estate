@@ -100,8 +100,16 @@ test('sorts the bracket by measured exposure and reads levels like exiftool', as
   expect(await canvas.evaluate((c: HTMLCanvasElement) => c.width)).toBeGreaterThan(400);
   expect(await medianLuma(canvas)).toBeGreaterThan(20);
 
+  // Phase 3: the noise model is fitted and shown per CFA channel.
+  const noiseRows = page.getByTestId('noise-table').locator('tbody tr');
+  await expect(noiseRows).toHaveCount(4);
+  const gain = Number(await noiseRows.first().locator('td').first().textContent());
+  expect(gain, 'conversion gain in e⁻/DN').toBeGreaterThan(1);
+  expect(gain).toBeLessThan(20);
+
   await page.screenshot({ path: join(shotsDir, '02-loaded.png') });
   await page.screenshot({ path: join(shotsDir, '03-loaded-full.png'), fullPage: true });
+  await page.getByTestId('noise-panel').screenshot({ path: join(shotsDir, '06-noise.png') });
   expect(errors).toEqual([]);
 });
 

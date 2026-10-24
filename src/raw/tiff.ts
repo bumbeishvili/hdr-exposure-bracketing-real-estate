@@ -29,6 +29,8 @@ export interface IfdEntry {
 export interface Ifd {
   /** File offset the IFD was read from. */
   readonly offset: number;
+  /** Entry count declared by the IFD (unreadable entries are not in `entries`). */
+  readonly count: number;
   readonly entries: ReadonlyMap<number, IfdEntry>;
   /** File offset of the next IFD in the chain, or 0. */
   readonly next: number;
@@ -91,7 +93,7 @@ export class TiffReader {
       if (pos < 0 || pos + size > this.view.byteLength) continue; // dangling pointer
       if (!entries.has(tag)) entries.set(tag, { tag, type, count, pos });
     }
-    return { offset, entries, next: this.u32(end) };
+    return { offset, count: n, entries, next: this.u32(end) };
   }
 
   /** Value `i` of an entry as a number (rationals are divided out). */

@@ -8,7 +8,8 @@ import type { FrameInfo, WorkerEvent, WorkerRequest } from '../worker/protocol.t
 import { h, replace } from './dom.ts';
 import * as fmt from './format.ts';
 import { evHistogram, histogramChart, type EvHistogram } from './histogram.ts';
-import { linearityChart } from './linearity.ts';
+import { lineChart } from './line-chart.ts';
+import type { NoiseModel } from '../analysis/noise.ts';
 import { autoGain, renderPreview } from './render-preview.ts';
 
 interface Slot {
@@ -50,6 +51,8 @@ class App {
   private slots: Slot[] = [];
   private exposures: Exposures | null = null;
   private exposureError = '';
+  private noise: NoiseModel | null = null;
+  private noiseError = '';
   private selected = -1;
   private matched = false;
   private showClipping = true;
@@ -72,6 +75,7 @@ class App {
   private readonly exposurePanel = h('section', { class: 'panel', 'data-testid': 'exposure-panel' });
   private readonly pairsPanel = h('section', { class: 'panel', 'data-testid': 'pairs-panel' });
   private readonly linearityPanel = h('section', { class: 'panel', 'data-testid': 'linearity-panel' });
+  private readonly noisePanel = h('section', { class: 'panel', 'data-testid': 'noise-panel' });
   private readonly metadataPanel = h('section', { class: 'panel', 'data-testid': 'metadata-panel' });
 
   constructor(root: HTMLElement) {
@@ -108,6 +112,8 @@ class App {
     this.slots = arw.map((f, index) => ({ index, fileName: f.name }));
     this.exposures = null;
     this.exposureError = '';
+    this.noise = null;
+    this.noiseError = '';
     this.selected = -1;
     this.matched = false;
     this.gainCache = null;
@@ -123,9 +129,11 @@ class App {
   private onWorkerEvent(ev: WorkerEvent): void {
     switch (ev.type) {
       case 'progress': {
-        const verb = { reading: 'Reading', decoding: 'Decoding', measuring: 'Measuring exposure ratios' }[ev.stage];
-        const label = ev.stage === 'measuring' ? `${verb}…` : `${verb} ${ev.fileName} · ${ev.index + 1} of ${ev.total}`;
-        this.renderStatus(label, (ev.index + (ev.stage === 'decoding' ? 0.5 : 0)) / (ev.total + 1));
+        const verb = { reading: 'Reading', decoding: 'Decoding', measuring: 'Measuring exposure ratios', noise: 'Fitting the noise model' }[ev.stage];
+        const perFile = ev.stage === 'reading' || ev.stage === 'decoding';
+        const label = perFile ? `${verb} ${ev.fileName} · ${ev.index + 1} of ${ev.total}` : `${verb}…`;
+        const done = ev.stage === 'noise' ? ev.total + 0.5 : ev.index + (ev.stage === 'decoding' ? 0.5 : 0);
+        this.renderStatus(label, done / (ev.total + 1));
         break;
       }
       case 'frame': {
@@ -148,6 +156,14 @@ class App {
       case 'exposures-error':
         this.exposureError = ev.message;
         this.renderAll();
+        break;
+      case 'noise':
+        this.noise = ev.noise;
+        this.renderNoise();
+        break;
+      case 'noise-error':
+        this.noiseError = ev.message;
+        this.renderNoise();
         break;
       case 'done': {
         this.totalMs = performance.now() - this.startedAt;
@@ -180,6 +196,7 @@ class App {
       this.exposurePanel,
       this.pairsPanel,
       this.linearityPanel,
+      this.noisePanel,
       this.metadataPanel,
     );
     replace(this.root, header, h('main', {}, this.empty, this.workspace));
@@ -275,11 +292,13 @@ class App {
     this.renderExposurePanel();
     this.renderPairsPanel();
     this.renderLinearity();
+    this.renderNoise();
     this.renderMetadata();
   }
 
   private renderCharts(): void {
     this.renderLinearity();
+    this.renderNoise();
     this.renderInspector();
   }
 
@@ -393,7 +412,7 @@ class App {
       this.canvas.setAttribute('aria-label', `Preview of ${slot.fileName}`);
       this.canvas.dataset.file = slot.fileName;
       const e = this.exposures?.byFile.get(slot.index);
-      const mode = this.matched ? `matched to the base frame (×2^${fmt.signed(-(e?.measuredEv ?? 0))})` : 'as shot, relative to the base frame';
+      const mode = this.matched ? `matched to the base frame (${fmt.ev(-(e?.measuredEv ?? 0))} gain)` : 'as shot, relative to the base frame';
       replace(
         this.viewerCaption,
         h('strong', {}, slot.fileName),
@@ -645,13 +664,123 @@ class App {
     }
     const ref = this.slots[this.exposures.reference].info!;
     const black = ref.blackLevel[0];
-    const markers = [
-      { level: 1, label: `SR2 white ${ref.linearLimit}` },
-      { level: (ref.whiteLevel - black) / (ref.linearLimit - black), label: `clip ${ref.whiteLevel}` },
-    ];
-    const series = this.exposures.pairs.map((p) => ({ label: `${stem(this.slots[p.brightFile].fileName)} ÷ ${stem(this.slots[p.darkFile].fileName)}`, bins: p.estimate.linearity }));
-    const width = Math.max(320, this.linearityPanel.clientWidth - 36);
-    replace(this.linearityPanel, ...head, linearityChart(series, markers, width));
+    const clipLevel = (ref.whiteLevel - black) / (ref.linearLimit - black);
+    const series = this.exposures.pairs.map((p) => ({
+      label: this.pairLabel(p.brightFile, p.darkFile),
+      points: p.estimate.linearity.map((b) => ({ x: b.level, y: (b.relative - 1) * 100, note: `${fmt.integer(b.blocks)} blocks` })),
+    }));
+    const span = Math.max(0.5, ...series.flatMap((sr) => sr.points.map((p) => Math.abs(p.y)))) * 1.2;
+    const step = span > 2 ? 1 : span > 1 ? 0.5 : 0.25;
+    const yMax = Math.ceil(span / step) * step;
+    const yTicks: number[] = [];
+    for (let v = -yMax; v <= yMax + 1e-9; v += step) yTicks.push(Number(v.toFixed(4)));
+    const xMax = Math.max(1.1, clipLevel + 0.02);
+    replace(
+      this.linearityPanel,
+      ...head,
+      lineChart(series, {
+        width: Math.max(320, this.linearityPanel.clientWidth - 36),
+        x: { min: 0, max: xMax, ticks: [0, 0.25, 0.5, 0.75, 1], format: (v) => `${Math.round(v * 100)}%` },
+        y: { min: -yMax, max: yMax, ticks: yTicks, format: (v) => (v === 0 ? '0' : `${fmt.signed(v, 2)}%`), reference: 0 },
+        markers: [
+          { x: 1, label: `SR2 white ${ref.linearLimit}` },
+          { x: clipLevel, label: `clip ${ref.whiteLevel}` },
+        ],
+        label: 'Exposure ratio deviation against brightness for each adjacent pair',
+        readoutTitle: (x) => `Brighter frame at ${Math.round(x * 100)}% of the SR2 white level`,
+        readoutValue: (y) => `${fmt.signed(y, 2)}%`,
+      }),
+    );
+  }
+
+  private pairLabel(brightFile: number, darkFile: number): string {
+    return `${stem(this.slots[brightFile].fileName)} ÷ ${stem(this.slots[darkFile].fileName)}`;
+  }
+
+  private renderNoise(): void {
+    const head = [h('h2', {}, 'Noise model')];
+    const noise = this.noise;
+    const exposures = this.exposures;
+    if (!noise || !exposures) {
+      head.push(h('p', { class: 'lead' }, this.noiseError ? `The noise model could not be fitted: ${this.noiseError}` : 'Fitting once the exposure ratios are known…'));
+      replace(this.noisePanel, ...head);
+      return;
+    }
+    const ref = this.slots[exposures.reference].info!;
+    const range = ref.whiteLevel - ref.blackLevel[0];
+    const offsets = noise.pairs.flatMap((p) => p.blackOffset);
+    const worstOffset = Math.max(...offsets.map(Math.abs));
+    head.push(
+      h(
+        'p',
+        { class: 'lead' },
+        `Fitted from adjacent-frame differences on flat pixels, where the scene and the pixel-response pattern cancel. Var(v) = α(t)·s + β per channel; the shot-noise slope α rises ${fmt.percent(noise.timeSlope, 1)} per doubling of shutter time. Black level checks out within ${worstOffset.toFixed(2)} DN of the file’s ${ref.blackLevel[0]}.`,
+      ),
+    );
+    const rows = noise.channels.map((c, p) => {
+      const gain = 1 / c.alpha;
+      const read = Math.sqrt(c.beta);
+      const colour = 'rgb'[ref.cfaPattern.colors[p]];
+      return h(
+        'tr',
+        {},
+        h('th', { scope: 'row' }, h('span', { class: `key key-${colour}` }), c.name),
+        h('td', { class: 'num' }, gain.toFixed(2)),
+        h('td', { class: 'num' }, read.toFixed(2)),
+        h('td', { class: 'num' }, (read * gain).toFixed(1)),
+        h('td', { class: 'num' }, fmt.integer(range * gain)),
+        h('td', { class: 'num strong' }, Math.log2(range / read).toFixed(1)),
+      );
+    });
+    const table = h(
+      'table',
+      { class: 'data', 'data-testid': 'noise-table' },
+      h(
+        'thead',
+        {},
+        h(
+          'tr',
+          {},
+          h('th', {}, 'Channel'),
+          h('th', { class: 'num' }, `Gain at ${fmt.shutter(noise.referenceTime)} (e⁻/DN)`),
+          h('th', { class: 'num' }, 'Read noise (DN)'),
+          h('th', { class: 'num' }, 'Read noise (e⁻)'),
+          h('th', { class: 'num' }, 'Full well (e⁻)'),
+          h('th', { class: 'num' }, 'Dynamic range (stops)'),
+        ),
+      ),
+      h('tbody', {}, ...rows),
+    );
+
+    // Residual check: measured ÷ predicted variance per signal bin, averaged over the CFA positions.
+    // noise.pairs follows exposures.pairs, which carries the file indices.
+    const series = noise.pairs.map((p, k) => {
+      const byBin = new Map<number, { sum: number; n: number; samples: number }>();
+      for (const bins of p.bins) {
+        for (const b of bins) {
+          const key = Math.round(Math.log2(b.signal) * 3);
+          const e = byBin.get(key) ?? { sum: 0, n: 0, samples: 0 };
+          e.sum += b.measured / b.predicted;
+          e.n++;
+          e.samples += b.samples;
+          byBin.set(key, e);
+        }
+      }
+      return {
+        label: this.pairLabel(exposures.pairs[k].brightFile, exposures.pairs[k].darkFile),
+        points: [...byBin.entries()].sort(([a], [b]) => a - b).map(([key, e]) => ({ x: 2 ** (key / 3), y: e.sum / e.n, note: `${fmt.integer(e.samples)} px` })),
+      };
+    });
+    const chart = lineChart(series, {
+      width: Math.max(320, this.noisePanel.clientWidth - 36),
+      height: 220,
+      x: { min: 4, max: 16384, log: true, ticks: [4, 16, 64, 256, 1024, 4096, 16384], format: (v) => (v >= 1024 ? `${v / 1024}k` : String(v)) },
+      y: { min: 0.6, max: 1.4, ticks: [0.6, 0.8, 1, 1.2, 1.4], format: (v) => `×${v.toFixed(1)}`, reference: 1 },
+      label: 'Measured over predicted residual variance against signal, per adjacent pair',
+      readoutTitle: (x) => `Signal ≈ ${fmt.integer(x)} DN above black`,
+      readoutValue: (y) => `×${y.toFixed(2)}`,
+    });
+    replace(this.noisePanel, ...head, table, h('h3', { class: 'panel-h3' }, 'Residual check', h('span', { class: 'h3-note' }, 'measured ÷ predicted variance of each pair’s difference; 1 means the model is right')), chart);
   }
 
   private renderMetadata(): void {
@@ -674,7 +803,7 @@ class App {
       ['White level', (i) => `${i.whiteLevel} · ${i.sources.whiteLevel}`],
       ['SR2 white', (i) => i.sr2WhiteLevel?.join(' / ') ?? '—'],
       ['As-shot WB (RGGB)', (i) => (i.asShotWb ? `${i.asShotWb.join(' / ')} · ${i.sources.asShotWb}` : '—')],
-      ['SR2 block', (i) => (i.sr2 ? `${fmt.integer(i.sr2.length)} B at ${fmt.integer(i.sr2.offset)} · key ${fmt.hex32(i.sr2.key)} · ${i.sr2.tagCount} tags` : 'not found')],
+      ['SR2 block', (i) => (i.sr2 ? `${fmt.integer(i.sr2.length)} B at ${fmt.integer(i.sr2.offset)} · key ${fmt.hex32(i.sr2.key)} · ${i.sr2.entryCount} entries` : 'not found')],
       ['Shutter (stored)', (i) => `${i.exposure.exposureTimeRational[0]}/${i.exposure.exposureTimeRational[1]} s`],
       ['Aperture', (i) => `f/${i.exposure.fNumber}`],
       ['ISO', (i) => String(i.exposure.iso)],

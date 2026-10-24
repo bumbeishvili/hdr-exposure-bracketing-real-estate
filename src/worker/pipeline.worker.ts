@@ -4,6 +4,7 @@
 import { readArw, type RawFrame } from '../raw/arw.ts';
 import { computeFrameStats } from '../analysis/stats.ts';
 import { analyzeExposures, linearLimit } from '../analysis/exposure.ts';
+import { fitNoiseModel } from '../analysis/noise.ts';
 import { makePreview } from '../analysis/preview.ts';
 import type { FrameInfo, WorkerEvent, WorkerRequest } from './protocol.ts';
 
@@ -43,14 +44,25 @@ async function open(files: File[]): Promise<void> {
   if (frames.length >= 2) {
     const t0 = performance.now();
     post({ type: 'progress', index: files.length, total: files.length, fileName: '', stage: 'measuring' });
+    const raw = frames.map((f) => f.frame);
+    let analysis;
     try {
-      const analysis = analyzeExposures(
-        frames.map((f) => f.frame),
+      analysis = analyzeExposures(
+        raw,
         frames.map((f) => f.meanSignal),
       );
       post({ type: 'exposures', indices: frames.map((f) => f.index), analysis, ms: performance.now() - t0 });
     } catch (err) {
       post({ type: 'exposures-error', message: err instanceof Error ? err.message : String(err) });
+    }
+    if (analysis) {
+      const t1 = performance.now();
+      post({ type: 'progress', index: files.length, total: files.length, fileName: '', stage: 'noise' });
+      try {
+        post({ type: 'noise', noise: fitNoiseModel(raw, analysis), ms: performance.now() - t1 });
+      } catch (err) {
+        post({ type: 'noise-error', message: err instanceof Error ? err.message : String(err) });
+      }
     }
   }
   post({ type: 'done', ms: performance.now() - start });
@@ -61,7 +73,7 @@ function frameInfo(frame: RawFrame, fileSize: number): FrameInfo {
   return {
     ...rest,
     fileSize,
-    sr2: sr2 ? { offset: sr2.offset, length: sr2.length, key: sr2.key, tagCount: sr2.tags.size } : null,
+    sr2: sr2 ? { offset: sr2.offset, length: sr2.length, key: sr2.key, entryCount: sr2.entryCount } : null,
     linearLimit: linearLimit(frame),
   };
 }
