@@ -1,0 +1,25 @@
+{
+  "name": "hdr-merger",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-based HDR merger for bracketed Sony A7C II ARW files",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:e2e": "playwright test",
+    "fixtures:exif": "sh scripts/exif-fixtures.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0",
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}
