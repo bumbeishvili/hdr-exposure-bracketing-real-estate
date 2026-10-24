@@ -1,16 +1,19 @@
 // Bracket inspector UI: open a set of ARW files, decode them in a worker, and
-// show per-frame statistics next to the measured exposure ratios.
+// show per-frame statistics, the measured exposure ratios, the noise model and
+// the merged HDR result.
 
 import type { ExposureAnalysis, FrameExposure, PairRatio } from '../analysis/exposure.ts';
+import type { NoiseModel } from '../analysis/noise.ts';
 import type { PreviewData } from '../analysis/preview.ts';
 import type { FrameStats } from '../analysis/stats.ts';
-import type { FrameInfo, WorkerEvent, WorkerRequest } from '../worker/protocol.ts';
+import type { ExportSize, FrameInfo, LensInfo, LookSettings, MergeSummary, UprightInfo, WbSetting, WorkerEvent, WorkerRequest } from '../worker/protocol.ts';
+import type { DemosaicAlgorithm, Rect } from '../demosaic/demosaic.ts';
+import { REAL_ESTATE_LOOK } from '../look/defaults.ts';
 import { h, replace } from './dom.ts';
 import * as fmt from './format.ts';
 import { evHistogram, histogramChart, type EvHistogram } from './histogram.ts';
 import { lineChart } from './line-chart.ts';
-import type { NoiseModel } from '../analysis/noise.ts';
-import { autoGain, renderPreview } from './render-preview.ts';
+import { autoGain, luminancePercentile, renderPreview } from './render-preview.ts';
 
 interface Slot {
   index: number;
@@ -29,8 +32,35 @@ interface Exposures {
   order: number[];
   reference: number;
   pairs: Array<PairRatio & { brightFile: number; darkFile: number }>;
+  /** Analysis position → file index (the worker's frame arrays skip failed files). */
+  files: number[];
   ms: number;
 }
+
+/** Selection values for the merged result and the finished look. */
+const MERGED = -2;
+const FINAL = -3;
+
+type WbMode = 'auto' | 'asShot' | 'camera' | 'custom';
+
+/** Temperature slider: 0…1000 on a log scale from 2500 K to 10000 K. */
+const tempToSlider = (t: number): number => Math.round((1000 * Math.log(t / 2500)) / Math.log(4));
+const sliderToTemp = (v: number): number => 2500 * 4 ** (v / 1000);
+
+/** Categorical slots (dark steps) for per-frame identity, darkest frame first. */
+const FRAME_COLORS: ReadonlyArray<readonly [number, number, number]> = [
+  [0x39, 0x87, 0xe5],
+  [0xd9, 0x59, 0x26],
+  [0x19, 0x9e, 0x70],
+  [0xc9, 0x85, 0x00],
+  [0xd5, 0x51, 0x81],
+  [0x00, 0x83, 0x00],
+  [0x90, 0x85, 0xe9],
+  [0xe6, 0x67, 0x67],
+];
+/** Overlay for areas where deghosting kept moving content from one frame. */
+const GHOST_COLORS: ReadonlyArray<readonly [number, number, number]> = [[0xe0, 0x3c, 0x9a]];
+const css = (c: readonly [number, number, number]): string => `rgb(${c[0]} ${c[1]} ${c[2]})`;
 
 export function startApp(root: HTMLElement): void {
   new App(root);
@@ -53,13 +83,39 @@ class App {
   private exposureError = '';
   private noise: NoiseModel | null = null;
   private noiseError = '';
+  private merge: MergeSummary | null = null;
+  private mergeError = '';
   private selected = -1;
   private matched = false;
   private showClipping = true;
   private evOffset = 0;
+  private mergedTone: 'linear' | 'global' = 'global';
+  private showSources = false;
   private startedAt = 0;
   private totalMs = 0;
   private gainCache: { file: number; value: number } | null = null;
+  private whiteCache: { gain: number; value: number } | null = null;
+  /** Merged view: whole image, or a full-resolution crop demosaiced on demand. */
+  private zoom: 'fit' | 'crop' = 'fit';
+  private demosaic: DemosaicAlgorithm = 'rcd';
+  private cropCenter: { x: number; y: number } | null = null;
+  private crop: { id: number; rect: Rect; algorithm: DemosaicAlgorithm; data: PreviewData; ms: number } | null = null;
+  private cropRequest = 0;
+  /** The finished real-estate look. */
+  private lookInfo: { profile: string; wb: { auto: WbSetting & { coverage: number }; asShot: WbSetting; camera: WbSetting | null }; upright: UprightInfo; lens: LensInfo } | null = null;
+  private lookSettings: LookSettings | null = null;
+  private wbMode: WbMode = 'auto';
+  private lookImage: { id: number; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; sizes: Record<ExportSize, [number, number]>; ms: number } | null = null;
+  private lookRequest = 0;
+  private lookTimer = 0;
+  private lookError = '';
+  private showBefore = false;
+  private picking = false;
+  private exportRequest = 0;
+  private exportStatus = '';
+  private exportBusy = false;
+  private exportSize: ExportSize = 'full';
+  private showGhosts = false;
 
   private readonly input = h('input', { id: 'file-input', type: 'file', accept: '.arw,.ARW', multiple: true, hidden: true, 'data-testid': 'file-input' });
   private readonly status = h('div', { class: 'status', role: 'status', 'data-testid': 'status' });
@@ -71,11 +127,12 @@ class App {
   private readonly viewerCaption = h('div', { class: 'viewer-caption' });
   private readonly toolbar = h('div', { class: 'viewer-toolbar' });
   private readonly inspector = h('aside', { class: 'inspector', 'data-testid': 'inspector' });
-  private readonly filmstrip = h('div', { class: 'filmstrip', role: 'listbox', 'aria-label': 'Frames by measured exposure', 'data-testid': 'filmstrip' });
+  private readonly filmstrip = h('div', { class: 'filmstrip', role: 'listbox', 'aria-label': 'Merged result and frames by measured exposure', 'data-testid': 'filmstrip' });
   private readonly exposurePanel = h('section', { class: 'panel', 'data-testid': 'exposure-panel' });
   private readonly pairsPanel = h('section', { class: 'panel', 'data-testid': 'pairs-panel' });
   private readonly linearityPanel = h('section', { class: 'panel', 'data-testid': 'linearity-panel' });
   private readonly noisePanel = h('section', { class: 'panel', 'data-testid': 'noise-panel' });
+  private readonly mergePanel = h('section', { class: 'panel', 'data-testid': 'merge-panel' });
   private readonly metadataPanel = h('section', { class: 'panel', 'data-testid': 'metadata-panel' });
 
   constructor(root: HTMLElement) {
@@ -90,6 +147,7 @@ class App {
     });
     this.bindDragAndDrop();
     this.bindKeys();
+    this.bindCanvas();
     let resizeTimer = 0;
     window.addEventListener('resize', () => {
       clearTimeout(resizeTimer);
@@ -114,9 +172,25 @@ class App {
     this.exposureError = '';
     this.noise = null;
     this.noiseError = '';
+    this.merge = null;
+    this.mergeError = '';
+    this.zoom = 'fit';
+    this.crop = null;
+    this.cropCenter = null;
+    this.lookInfo = null;
+    this.lookSettings = null;
+    this.lookImage = null;
+    this.lookError = '';
+    this.wbMode = 'auto';
+    this.showBefore = false;
+    this.picking = false;
+    this.exportStatus = '';
+    this.exportBusy = false;
+    this.showGhosts = false;
     this.selected = -1;
     this.matched = false;
     this.gainCache = null;
+    this.whiteCache = null;
     this.startedAt = performance.now();
     this.empty.hidden = true;
     this.workspace.hidden = false;
@@ -129,17 +203,26 @@ class App {
   private onWorkerEvent(ev: WorkerEvent): void {
     switch (ev.type) {
       case 'progress': {
-        const verb = { reading: 'Reading', decoding: 'Decoding', measuring: 'Measuring exposure ratios', noise: 'Fitting the noise model' }[ev.stage];
+        const verb = {
+          reading: 'Reading',
+          decoding: 'Decoding',
+          measuring: 'Measuring exposure ratios',
+          noise: 'Fitting the noise model',
+          aligning: 'Aligning frames',
+          deghosting: 'Finding moving objects',
+          merging: 'Merging',
+        }[ev.stage];
         const perFile = ev.stage === 'reading' || ev.stage === 'decoding';
         const label = perFile ? `${verb} ${ev.fileName} · ${ev.index + 1} of ${ev.total}` : `${verb}…`;
-        const done = ev.stage === 'noise' ? ev.total + 0.5 : ev.index + (ev.stage === 'decoding' ? 0.5 : 0);
+        const after = { measuring: 0.1, noise: 0.3, aligning: 0.5, deghosting: 0.6, merging: 0.7 } as Record<string, number>;
+        const done = perFile ? ev.index + (ev.stage === 'decoding' ? 0.5 : 0) : ev.total + (after[ev.stage] ?? 0);
         this.renderStatus(label, done / (ev.total + 1));
         break;
       }
       case 'frame': {
         const slot = this.slots[ev.index];
         Object.assign(slot, { info: ev.info, stats: ev.stats, preview: ev.preview, ms: ev.ms, hist: evHistogram(ev.stats, ev.info) });
-        if (this.selected < 0) this.selected = ev.index;
+        if (this.selected === -1) this.selected = ev.index;
         this.renderAll();
         break;
       }
@@ -165,11 +248,99 @@ class App {
         this.noiseError = ev.message;
         this.renderNoise();
         break;
+      case 'merged':
+        if (!this.merge) this.selected = MERGED; // a re-merge keeps the current view
+        this.merge = ev.merge;
+        this.whiteCache = null;
+        this.crop = null;
+        if (this.zoom === 'crop') this.requestCrop();
+        this.renderAll();
+        break;
+      case 'merge-error':
+        this.mergeError = ev.message;
+        this.renderAll();
+        break;
+      case 'crop':
+        if (ev.id !== this.cropRequest) break; // superseded by a newer request
+        this.crop = {
+          id: ev.id,
+          rect: ev.rect,
+          algorithm: ev.algorithm,
+          data: { width: ev.rect.width, height: ev.rect.height, rgb: ev.rgb, clip: new Uint8Array(ev.rect.width * ev.rect.height) },
+          ms: ev.ms,
+        };
+        this.renderImages();
+        break;
+      case 'crop-error':
+        if (ev.id === this.cropRequest) replace(this.viewerCaption, `Could not demosaic this crop: ${ev.message}`);
+        break;
+      case 'look-ready': {
+        const remerged = !!this.lookSettings; // a re-merge keeps the look the user has set
+        this.lookInfo = { profile: ev.profile, wb: ev.wb, upright: ev.upright, lens: ev.lens };
+        if (!remerged) {
+          this.lookSettings = this.defaultLook();
+          this.wbMode = 'auto';
+          this.selected = FINAL;
+        }
+        this.requestLook(0);
+        this.renderAll();
+        break;
+      }
+      case 'look':
+        if (!this.lookImage || ev.id >= this.lookImage.id) {
+          const first = !this.lookImage;
+          this.lookImage = { id: ev.id, width: ev.width, height: ev.height, rgba: ev.rgba, exposures: ev.exposures, sizes: ev.sizes, ms: ev.ms };
+          this.lookError = '';
+          if (first) this.renderToolbar(); // enables Export
+          else this.refreshExportSizes();
+          this.renderImages();
+          this.renderLookStatus();
+        }
+        break;
+      case 'export-progress':
+        if (ev.id === this.exportRequest && this.exportBusy) {
+          this.exportStatus = `Rendering full detail… ${Math.round(100 * ev.fraction)}%`;
+          const note = this.toolbar.querySelector('[data-testid="export-status"]');
+          if (note) note.textContent = this.exportStatus;
+        }
+        break;
+      case 'export': {
+        if (ev.id !== this.exportRequest) break;
+        const base = this.exposures ? stem(this.slots[this.exposures.reference].fileName) : 'merged';
+        const url = URL.createObjectURL(ev.blob);
+        const a = h('a', { href: url, download: `${base}-HDR.${ev.format === 'dng' ? 'dng' : 'jpg'}` });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        this.exportBusy = false;
+        const what = ev.format === 'dng' ? 'float DNG' : 'JPEG';
+        this.exportStatus = `Exported ${ev.width} × ${ev.height} ${what} (${fmt.megabytes(ev.blob.size)}) in ${(ev.ms / 1000).toFixed(1)} s`;
+        this.renderToolbar();
+        break;
+      }
+      case 'neutral-picked':
+        if (this.lookSettings) {
+          this.lookSettings = { ...this.lookSettings, wb: ev.wb };
+          this.wbMode = 'custom';
+          this.requestLook(0);
+          this.renderInspector();
+        }
+        break;
+      case 'look-error':
+        if (ev.id === this.exportRequest && this.exportBusy) {
+          this.exportBusy = false;
+          this.exportStatus = `Export failed: ${ev.message}`;
+        } else this.lookError = ev.message;
+        this.renderToolbar();
+        this.renderLookStatus();
+        break;
       case 'done': {
         this.totalMs = performance.now() - this.startedAt;
         const ok = this.slots.filter((s) => s.info).length;
         const failed = this.slots.length - ok;
-        this.renderStatus(`${ok} frame${ok === 1 ? '' : 's'} decoded in ${(this.totalMs / 1000).toFixed(1)} s${failed ? ` · ${failed} failed` : ''}`);
+        const what = this.merge ? `${ok} frames decoded and merged` : `${ok} frame${ok === 1 ? '' : 's'} decoded`;
+        this.renderStatus(`${what} in ${(this.totalMs / 1000).toFixed(1)} s${failed ? ` · ${failed} failed` : ''}`);
         this.renderSummary();
         break;
       }
@@ -183,7 +354,7 @@ class App {
     const header = h(
       'header',
       { class: 'topbar' },
-      h('div', { class: 'brand' }, logo, h('div', {}, h('h1', {}, 'HDR Merger'), h('p', {}, 'Bracket inspector · Sony A7C II ARW'))),
+      h('div', { class: 'brand' }, logo, h('div', {}, h('h1', {}, 'HDR Merger'), h('p', {}, 'Bracket merge · Sony A7C II ARW'))),
       h('div', { class: 'status-wrap' }, this.status, h('div', { class: 'progress' }, this.progressBar)),
       h('label', { class: 'button primary', for: 'file-input' }, 'Open ARW files'),
       this.input,
@@ -193,6 +364,7 @@ class App {
       this.workspace,
       this.summary,
       h('div', { class: 'stage' }, h('div', { class: 'stage-main' }, viewer, this.filmstrip), this.inspector),
+      this.mergePanel,
       this.exposurePanel,
       this.pairsPanel,
       this.linearityPanel,
@@ -247,7 +419,7 @@ class App {
       const target = e.target as HTMLElement;
       if (target.closest('input, select, textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-        const order = this.displayOrder().filter((i) => this.slots[i].preview);
+        const order = this.navigationOrder();
         const at = order.indexOf(this.selected);
         if (at < 0) return;
         const next = order[Math.max(0, Math.min(order.length - 1, at + (e.key === 'ArrowLeft' ? -1 : 1)))];
@@ -263,12 +435,105 @@ class App {
         this.showClipping = !this.showClipping;
         this.renderToolbar();
         this.renderImages();
+      } else if (e.key === 's' && this.merge) {
+        this.showSources = !this.showSources;
+        this.renderToolbar();
+        this.renderImages();
+      } else if (e.key === 'g' && this.merge?.ghostMap) {
+        this.showGhosts = !this.showGhosts;
+        this.renderToolbar();
+        this.renderImages();
+      } else if (e.key === 'z' && this.merge && this.selected === MERGED) {
+        this.setZoom(this.zoom === 'fit' ? 'crop' : 'fit');
+      } else if (e.key === 'b' && this.selected === FINAL) {
+        this.showBefore = !this.showBefore;
+        this.renderToolbar();
+        this.renderImages();
+      } else if (e.key === 'w' && this.selected === FINAL) {
+        this.picking = !this.picking;
+        this.renderToolbar();
+        this.renderImages();
       }
     });
   }
 
+  /** Merged view: click to zoom to 100% there; in 100%, drag to pan and click to zoom out. */
+  private bindCanvas(): void {
+    let drag: { x: number; y: number; center: { x: number; y: number }; moved: boolean } | null = null;
+    this.canvas.addEventListener('click', (e) => {
+      if (this.selected !== FINAL || !this.picking || !this.worker) return;
+      const box = this.canvas.getBoundingClientRect();
+      const request: WorkerRequest = {
+        type: 'pick-neutral',
+        x: (e.clientX - box.left) / box.width,
+        y: (e.clientY - box.top) / box.height,
+        upright: this.lookSettings?.upright ?? false,
+        lens: this.lookSettings?.lens ?? false,
+      };
+      this.worker.postMessage(request);
+      this.picking = false;
+      this.renderToolbar();
+      this.renderImages();
+    });
+    this.canvas.addEventListener('pointerdown', (e) => {
+      if (this.selected !== MERGED || !this.merge) return;
+      drag = { x: e.clientX, y: e.clientY, center: this.cropCenter ?? { x: this.merge.width / 2, y: this.merge.height / 2 }, moved: false };
+      this.canvas.setPointerCapture(e.pointerId);
+    });
+    this.canvas.addEventListener('pointermove', (e) => {
+      if (!drag || this.zoom !== 'crop') return;
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (Math.hypot(dx, dy) > 3) drag.moved = true;
+      if (drag.moved) this.canvas.style.transform = `translate(${dx}px, ${dy}px)`;
+    });
+    this.canvas.addEventListener('pointerup', (e) => {
+      const d = drag;
+      drag = null;
+      if (!d || !this.merge) return;
+      this.canvas.style.transform = '';
+      if (this.zoom === 'fit') {
+        const box = this.canvas.getBoundingClientRect();
+        this.cropCenter = { x: ((e.clientX - box.left) / box.width) * this.merge.width, y: ((e.clientY - box.top) / box.height) * this.merge.height };
+        this.setZoom('crop');
+      } else if (d.moved) {
+        // At 100% one CSS pixel is one image pixel.
+        this.cropCenter = { x: d.center.x - (e.clientX - d.x), y: d.center.y - (e.clientY - d.y) };
+        this.requestCrop();
+      } else {
+        this.setZoom('fit');
+      }
+    });
+  }
+
+  private setZoom(zoom: 'fit' | 'crop'): void {
+    this.zoom = zoom;
+    if (zoom === 'crop') {
+      if (!this.cropCenter && this.merge) this.cropCenter = { x: this.merge.width / 2, y: this.merge.height / 2 };
+      this.requestCrop();
+    }
+    this.renderToolbar();
+    this.renderImages();
+  }
+
+  private requestCrop(): void {
+    const merge = this.merge;
+    const ref = this.referenceSlot();
+    if (!merge || !this.worker || !this.cropCenter || !ref?.info) return;
+    const viewer = this.canvas.parentElement as HTMLElement;
+    const width = Math.min(merge.width, Math.max(320, Math.floor(viewer.clientWidth - 36)));
+    const height = Math.min(merge.height, Math.round((width * 2) / 3));
+    const clamp = (v: number, hi: number): number => Math.max(0, Math.min(hi, Math.round(v)));
+    const rect = { x: clamp(this.cropCenter.x - width / 2, merge.width - width) & ~1, y: clamp(this.cropCenter.y - height / 2, merge.height - height) & ~1, width, height };
+    this.cropCenter = { x: rect.x + width / 2, y: rect.y + height / 2 };
+    const request: WorkerRequest = { type: 'crop', id: ++this.cropRequest, rect, algorithm: this.demosaic, wb: wbGains(ref.info) };
+    this.worker.postMessage(request);
+    replace(this.viewerCaption, h('strong', {}, 'Merged HDR'), ` · 100% · demosaicing with ${this.demosaic === 'rcd' ? 'RCD' : 'bilinear'}…`);
+  }
+
   private select(index: number): void {
     this.selected = index;
+    this.renderToolbar();
     this.renderInspector();
     this.renderFilmstrip();
     this.renderImages();
@@ -283,12 +548,80 @@ class App {
     return order;
   }
 
+  private navigationOrder(): number[] {
+    const frames = this.displayOrder().filter((i) => this.slots[i].preview);
+    return [...(this.lookInfo ? [FINAL] : []), ...(this.merge ? [MERGED] : []), ...frames];
+  }
+
+  /** Asks the worker for the finished look with the current settings, debounced for slider drags. */
+  private requestLook(delay = 90): void {
+    clearTimeout(this.lookTimer);
+    this.lookTimer = window.setTimeout(() => {
+      if (!this.worker || !this.lookSettings) return;
+      const request: WorkerRequest = { type: 'look', id: ++this.lookRequest, settings: this.lookSettings };
+      this.worker.postMessage(request);
+      this.renderLookStatus();
+    }, delay);
+  }
+
+  private exportLook(format: 'jpeg' | 'dng'): void {
+    if (!this.worker || !this.lookSettings || this.exportBusy) return;
+    const id = ++this.exportRequest;
+    const request: WorkerRequest =
+      format === 'dng' ? { type: 'export-dng', id, settings: this.lookSettings } : { type: 'export', id, settings: this.lookSettings, size: this.exportSize };
+    this.worker.postMessage(request);
+    this.exportBusy = true;
+    this.exportStatus = format === 'dng' ? 'Writing the DNG…' : this.exportSize === 'small' ? 'Rendering…' : 'Rendering full detail…';
+    this.renderToolbar();
+  }
+
+  /** The real-estate default look for this image. */
+  private defaultLook(): LookSettings {
+    const info = this.lookInfo!;
+    return { ...REAL_ESTATE_LOOK, wb: { temperature: info.wb.auto.temperature, tint: info.wb.auto.tint }, upright: info.upright.available, lens: info.lens.available };
+  }
+
+  /** Upright and lens corrections change the crop: keep the size menu's labels current without rebuilding it. */
+  private refreshExportSizes(): void {
+    for (const option of this.toolbar.querySelectorAll<HTMLOptionElement>('[data-testid="export-size"] option')) {
+      option.textContent = `${option.textContent?.split(' · ')[0]} · ${this.exportDimensions(option.value as ExportSize)}`;
+    }
+  }
+
+  /** Pixel size of an export under the current look. */
+  private exportDimensions(size: ExportSize): string {
+    const dims = this.lookImage?.sizes[size];
+    return dims ? `${dims[0]} × ${dims[1]}` : '';
+  }
+
+  private remerge(deghost: boolean): void {
+    if (!this.worker || !this.merge) return;
+    const request: WorkerRequest = { type: 'remerge', deghost };
+    this.worker.postMessage(request);
+    this.startedAt = performance.now();
+    this.renderStatus(deghost ? 'Merging with deghosting…' : 'Merging without deghosting…', 0.9);
+  }
+
+  private renderLookStatus(): void {
+    const el = this.inspector.querySelector('[data-testid="look-status"]');
+    if (!el) return;
+    const pending = this.lookImage && this.lookImage.id < this.lookRequest;
+    el.textContent = this.lookError
+      ? `Render failed: ${this.lookError}`
+      : !this.lookImage
+        ? 'Rendering…'
+        : pending
+          ? 'Updating…'
+          : `${this.lookImage.width} × ${this.lookImage.height} preview in ${Math.round(this.lookImage.ms)} ms · fused ${this.lookImage.exposures.length} synthetic exposures`;
+  }
+
   private renderAll(): void {
     this.renderSummary();
     this.renderToolbar();
     this.renderInspector();
     this.renderFilmstrip();
     this.renderImages();
+    this.renderMerge();
     this.renderExposurePanel();
     this.renderPairsPanel();
     this.renderLinearity();
@@ -326,14 +659,41 @@ class App {
       chips.push(['Measured range', `${fmt.signed(evs[0])} to ${fmt.signed(evs[evs.length - 1])} EV`]);
       chips.push([steps.length > 1 ? 'Steps' : 'Step', lo === hi ? `${lo} EV` : `${lo} to ${hi} EV`]);
     }
+    if (this.merge) chips.push(['Merged range', `${this.merge.dynamicRangeStops.toFixed(1)} stops`]);
     replace(this.summary, ...chips.map(([label, value]) => h('span', { class: 'chip' }, h('span', { class: 'chip-label' }, label), h('span', { class: 'chip-value' }, value))));
+  }
+
+  /** Size, JPEG and DNG export, and the export's progress. */
+  private exportControls(): HTMLElement {
+    const sizes: Array<[ExportSize, string]> = [
+      ['full', 'Full resolution'],
+      ['half', 'Half'],
+      ['small', 'Small'],
+    ];
+    const select = h(
+      'select',
+      { class: 'select', 'aria-label': 'Export size', 'data-testid': 'export-size', disabled: !this.lookImage || this.exportBusy },
+      ...sizes.map(([size, label]) => h('option', { value: size, selected: size === this.exportSize }, `${label} · ${this.exportDimensions(size)}`)),
+    );
+    select.addEventListener('change', () => (this.exportSize = select.value as ExportSize));
+    return h(
+      'div',
+      { class: 'export-controls' },
+      select,
+      h('button', { type: 'button', class: 'button primary', 'data-testid': 'export-jpeg', disabled: !this.lookImage || this.exportBusy, onclick: () => this.exportLook('jpeg') }, 'Export JPEG'),
+      h(
+        'button',
+        { type: 'button', class: 'button', 'data-testid': 'export-dng', title: 'The merged raw data as a 16-bit floating-point DNG, for Lightroom or Camera Raw', disabled: !this.lookImage || this.exportBusy, onclick: () => this.exportLook('dng') },
+        'DNG',
+      ),
+      this.exportStatus ? h('span', { class: 'toolbar-note', 'data-testid': 'export-status', role: 'status' }, this.exportStatus) : null,
+    );
   }
 
   private renderToolbar(): void {
     const segment = (label: string, active: boolean, disabled: boolean, onClick: () => void, testId: string): HTMLButtonElement =>
       h('button', { type: 'button', 'aria-pressed': String(active), disabled, onclick: onClick, 'data-testid': testId }, label);
-    const setMatched = (value: boolean) => () => {
-      this.matched = value;
+    const rerender = (): void => {
       this.renderToolbar();
       this.renderImages();
     };
@@ -344,19 +704,111 @@ class App {
       sliderValue.textContent = fmt.ev(this.evOffset);
       this.renderImages();
     });
+    const exposure = h('label', { class: 'slider' }, h('span', {}, 'Exposure'), slider, sliderValue);
+
+    if (this.selected === FINAL) {
+      replace(
+        this.toolbar,
+        h(
+          'div',
+          { class: 'segmented', role: 'group', 'aria-label': 'Before and after' },
+          segment('Before', this.showBefore, !this.merge, () => ((this.showBefore = true), rerender()), 'look-before'),
+          segment('After', !this.showBefore, false, () => ((this.showBefore = false), rerender()), 'look-after'),
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            class: `button${this.picking ? ' active' : ''}`,
+            'aria-pressed': String(this.picking),
+            'data-testid': 'pick-white',
+            onclick: () => ((this.picking = !this.picking), rerender()),
+          },
+          this.picking ? 'Click a white wall…' : 'Pick white',
+        ),
+        this.exportControls(),
+        h('span', { class: 'kbd-hint' }, h('kbd', {}, 'B'), ' before/after  ', h('kbd', {}, 'W'), ' pick white'),
+      );
+      return;
+    }
+
+    if (this.selected === MERGED) {
+      const sourceToggle = h('input', { type: 'checkbox', checked: this.showSources, 'data-testid': 'source-toggle' });
+      sourceToggle.addEventListener('change', () => {
+        this.showSources = sourceToggle.checked;
+        rerender();
+      });
+      const setDemosaic = (algorithm: DemosaicAlgorithm) => () => {
+        this.demosaic = algorithm;
+        this.requestCrop();
+        this.renderToolbar();
+      };
+      replace(
+        this.toolbar,
+        h(
+          'div',
+          { class: 'segmented', role: 'group', 'aria-label': 'Zoom' },
+          segment('Fit', this.zoom === 'fit', false, () => this.setZoom('fit'), 'zoom-fit'),
+          segment('100%', this.zoom === 'crop', false, () => this.setZoom('crop'), 'zoom-100'),
+        ),
+        this.zoom === 'crop'
+          ? h(
+              'div',
+              { class: 'segmented', role: 'group', 'aria-label': 'Demosaic' },
+              segment('RCD', this.demosaic === 'rcd', false, setDemosaic('rcd'), 'demosaic-rcd'),
+              segment('Bilinear', this.demosaic === 'bilinear', false, setDemosaic('bilinear'), 'demosaic-bilinear'),
+            )
+          : null,
+        h(
+          'div',
+          { class: 'segmented', role: 'group', 'aria-label': 'Tone curve' },
+          segment('Linear', this.mergedTone === 'linear', false, () => ((this.mergedTone = 'linear'), rerender()), 'tone-linear'),
+          segment('Global tone', this.mergedTone === 'global', false, () => ((this.mergedTone = 'global'), rerender()), 'tone-global'),
+        ),
+        h('label', { class: 'toggle' }, sourceToggle, h('span', {}, 'Source frames')),
+        this.merge?.ghostMap
+          ? h(
+              'label',
+              { class: 'toggle' },
+              (() => {
+                const box = h('input', { type: 'checkbox', checked: this.showGhosts, 'data-testid': 'ghost-toggle' });
+                box.addEventListener('change', () => {
+                  this.showGhosts = box.checked;
+                  rerender();
+                });
+                return box;
+              })(),
+              h('span', {}, 'Moving objects'),
+            )
+          : null,
+        this.showSources && this.exposures
+          ? h(
+              'span',
+              { class: 'clip-legend', 'data-testid': 'source-legend' },
+              ...this.exposures.order.flatMap((file, rank) => [
+                h('span', { class: 'swatch', style: `background:${css(FRAME_COLORS[rank % FRAME_COLORS.length])}` }),
+                fmt.shutter(this.slots[file].info?.exposure.exposureTime ?? NaN),
+              ]),
+            )
+          : null,
+        exposure,
+        h('span', { class: 'kbd-hint' }, h('kbd', {}, 'Z'), ' zoom  ', h('kbd', {}, 'S'), ' sources  ', h('kbd', {}, 'G'), ' moving'),
+      );
+      return;
+    }
+
     const clipToggle = h('input', { type: 'checkbox', checked: this.showClipping, 'data-testid': 'clip-toggle' });
     clipToggle.addEventListener('change', () => {
       this.showClipping = clipToggle.checked;
-      this.renderToolbar();
-      this.renderImages();
+      rerender();
     });
     replace(
       this.toolbar,
       h(
         'div',
         { class: 'segmented', role: 'group', 'aria-label': 'Preview brightness' },
-        segment('As shot', !this.matched, false, setMatched(false), 'mode-as-shot'),
-        segment('Matched', this.matched, !this.exposures, setMatched(true), 'mode-matched'),
+        segment('As shot', !this.matched, false, () => ((this.matched = false), rerender()), 'mode-as-shot'),
+        segment('Matched', this.matched, !this.exposures, () => ((this.matched = true), rerender()), 'mode-matched'),
       ),
       h('label', { class: 'toggle' }, clipToggle, h('span', {}, 'Clipping')),
       this.showClipping
@@ -369,7 +821,7 @@ class App {
             'all channels',
           )
         : null,
-      h('label', { class: 'slider' }, h('span', {}, 'Exposure'), slider, sliderValue),
+      exposure,
       h('span', { class: 'kbd-hint' }, h('kbd', {}, '←'), h('kbd', {}, '→'), ' frames  ', h('kbd', {}, 'M'), ' match  ', h('kbd', {}, 'C'), ' clipping'),
     );
   }
@@ -379,11 +831,16 @@ class App {
     return this.slots.find((s) => s.info?.exposure.exposureCompensation === 0) ?? this.slots.find((s) => s.preview);
   }
 
-  private gainFor(slot: Slot): number {
+  /** Gain that renders the base frame at a normal brightness, plus the exposure slider. */
+  private baseGain(): number {
     const ref = this.referenceSlot();
-    if (!ref?.preview || !ref.info) return 1;
+    if (!ref?.preview || !ref.info) return 2 ** this.evOffset;
     if (this.gainCache?.file !== ref.index) this.gainCache = { file: ref.index, value: autoGain(ref.preview, wbGains(ref.info)) };
-    let gain = this.gainCache.value * 2 ** this.evOffset;
+    return this.gainCache.value * 2 ** this.evOffset;
+  }
+
+  private gainFor(slot: Slot): number {
+    let gain = this.baseGain();
     if (this.matched && this.exposures) {
       const ev = this.exposures.byFile.get(slot.index)?.measuredEv;
       if (ev !== undefined) gain *= 2 ** -ev;
@@ -394,6 +851,47 @@ class App {
   private paint(canvas: HTMLCanvasElement, slot: Slot): void {
     const p = slot.preview;
     if (!p || !slot.info) return;
+    this.draw(canvas, p, { gain: this.gainFor(slot), wb: wbGains(slot.info), showClipping: this.showClipping });
+  }
+
+  private paintMerged(canvas: HTMLCanvasElement, thumbnail = false): void {
+    const merge = this.merge;
+    const ref = this.referenceSlot();
+    if (!merge || !ref?.info) return;
+    const wb = wbGains(ref.info);
+    const gain = this.baseGain();
+    const tone = thumbnail ? 'global' : this.mergedTone;
+    if (this.whiteCache?.gain !== gain) this.whiteCache = { gain, value: luminancePercentile(merge.preview, wb, gain, 0.999) };
+    if (!thumbnail && this.zoom === 'crop' && this.crop) {
+      // Same gain and white point as the whole image, so zooming does not change brightness.
+      this.draw(canvas, this.crop.data, { gain, wb, showClipping: false, tone, whitePoint: this.whiteCache.value });
+      return;
+    }
+    let overlay = null;
+    if (this.showGhosts && !thumbnail && merge.ghostMap) {
+      const index = new Uint8Array(merge.ghostMap.length);
+      for (let i = 0; i < index.length; i++) index[i] = merge.ghostMap[i] > 96 ? 0 : 255;
+      overlay = { index, colors: GHOST_COLORS };
+    } else if (this.showSources && !thumbnail && this.exposures) {
+      const rankOf = new Map(this.exposures.order.map((file, rank) => [file, rank]));
+      const index = new Uint8Array(merge.sourceMap.length);
+      for (let i = 0; i < index.length; i++) index[i] = (rankOf.get(this.exposures.files[merge.sourceMap[i]]) ?? 0) % FRAME_COLORS.length;
+      overlay = { index, colors: FRAME_COLORS };
+    }
+    this.draw(canvas, merge.preview, { gain, wb, showClipping: false, tone, whitePoint: this.whiteCache.value, overlay });
+  }
+
+  private drawLook(canvas: HTMLCanvasElement): void {
+    const img = this.lookImage;
+    if (!img) return;
+    if (canvas.width !== img.width || canvas.height !== img.height) {
+      canvas.width = img.width;
+      canvas.height = img.height;
+    }
+    canvas.getContext('2d')?.putImageData(new ImageData(new Uint8ClampedArray(img.rgba), img.width, img.height), 0, 0);
+  }
+
+  private draw(canvas: HTMLCanvasElement, p: PreviewData, options: Parameters<typeof renderPreview>[1]): void {
     if (canvas.width !== p.width || canvas.height !== p.height) {
       canvas.width = p.width;
       canvas.height = p.height;
@@ -401,74 +899,169 @@ class App {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const image = ctx.createImageData(p.width, p.height);
-    renderPreview(p, { gain: this.gainFor(slot), wb: wbGains(slot.info), showClipping: this.showClipping }, image);
+    renderPreview(p, options, image);
     ctx.putImageData(image, 0, 0);
   }
 
   private renderImages(): void {
-    const slot = this.slots[this.selected];
-    if (slot?.preview) {
-      this.paint(this.canvas, slot);
-      this.canvas.setAttribute('aria-label', `Preview of ${slot.fileName}`);
-      this.canvas.dataset.file = slot.fileName;
-      const e = this.exposures?.byFile.get(slot.index);
-      const mode = this.matched ? `matched to the base frame (${fmt.ev(-(e?.measuredEv ?? 0))} gain)` : 'as shot, relative to the base frame';
-      replace(
-        this.viewerCaption,
-        h('strong', {}, slot.fileName),
-        ` · ${mode} · camera RGB with as-shot WB, quarter-resolution bin of the CFA (no demosaic yet)`,
-      );
+    const finalThumb = this.filmstrip.querySelector<HTMLCanvasElement>('canvas[data-final]');
+    if (finalThumb && this.lookImage) this.drawLook(finalThumb);
+    if (this.selected === FINAL) {
+      this.canvas.classList.remove('crop', 'zoomable');
+      this.canvas.classList.toggle('picking', this.picking);
+      this.canvas.style.width = '';
+      this.canvas.style.height = '';
+      this.canvas.dataset.view = 'fit';
+      this.canvas.dataset.file = this.showBefore ? 'merged' : 'final';
+      if (this.showBefore && this.merge) {
+        const tone = this.mergedTone;
+        this.mergedTone = 'global';
+        this.paintMerged(this.canvas);
+        this.mergedTone = tone;
+        replace(this.viewerCaption, h('strong', {}, 'Before'), ' · the merge with a plain global tone curve and camera white balance');
+      } else if (this.lookImage) {
+        this.drawLook(this.canvas);
+        const s = this.lookSettings;
+        replace(
+          this.viewerCaption,
+          h('strong', {}, 'Final'),
+          s ? ` · ${Math.round(s.wb.temperature)} K / ${fmt.signed(s.wb.tint, 0)} tint · ${this.lookInfo?.profile ?? ''} colour · real-estate tone and finishing` : '',
+        );
+      } else {
+        replace(this.viewerCaption, h('strong', {}, 'Final'), ' · rendering…');
+      }
+      for (const thumb of this.filmstrip.querySelectorAll<HTMLCanvasElement>('canvas[data-index]')) {
+        const s = this.slots[Number(thumb.dataset.index)];
+        if (s) this.paint(thumb, s);
+      }
+      const mergedThumb = this.filmstrip.querySelector<HTMLCanvasElement>('canvas[data-merged]');
+      if (mergedThumb) this.paintMerged(mergedThumb, true);
+      return;
+    }
+    this.canvas.classList.remove('picking');
+    const crop = this.selected === MERGED && this.zoom === 'crop' ? this.crop : null;
+    this.canvas.classList.toggle('crop', !!crop);
+    this.canvas.classList.toggle('zoomable', this.selected === MERGED && !crop);
+    this.canvas.style.width = crop ? `${crop.rect.width}px` : '';
+    this.canvas.style.height = crop ? `${crop.rect.height}px` : '';
+    this.canvas.dataset.view = crop ? 'crop' : 'fit';
+    if (crop) this.canvas.dataset.algorithm = crop.algorithm;
+    else delete this.canvas.dataset.algorithm;
+    if (this.selected === MERGED && this.merge) {
+      this.paintMerged(this.canvas);
+      this.canvas.setAttribute('aria-label', 'Preview of the merged HDR result');
+      this.canvas.dataset.file = 'merged';
+      const tone = this.mergedTone === 'global' ? 'global tone curve (extended Reinhard)' : 'linear, clipped at white';
+      if (crop) {
+        const name = crop.algorithm === 'rcd' ? 'RCD' : 'bilinear';
+        replace(
+          this.viewerCaption,
+          h('strong', {}, 'Merged HDR'),
+          ` · 100% at (${crop.rect.x}, ${crop.rect.y}) · ${name} demosaic in ${Math.round(crop.ms)} ms · ${tone} · drag to pan, click to fit`,
+        );
+      } else {
+        replace(
+          this.viewerCaption,
+          h('strong', {}, 'Merged HDR'),
+          ` · ${tone} · camera RGB with the base frame’s WB, quarter-resolution bin of the merged CFA · click to see 100%`,
+        );
+      }
+    } else {
+      const slot = this.slots[this.selected];
+      if (slot?.preview) {
+        this.paint(this.canvas, slot);
+        this.canvas.setAttribute('aria-label', `Preview of ${slot.fileName}`);
+        this.canvas.dataset.file = slot.fileName;
+        const e = this.exposures?.byFile.get(slot.index);
+        const mode = this.matched ? `matched to the base frame (${fmt.ev(-(e?.measuredEv ?? 0))} gain)` : 'as shot, relative to the base frame';
+        replace(this.viewerCaption, h('strong', {}, slot.fileName), ` · ${mode} · camera RGB with as-shot WB, quarter-resolution bin of the CFA (no demosaic yet)`);
+      }
     }
     for (const thumb of this.filmstrip.querySelectorAll<HTMLCanvasElement>('canvas[data-index]')) {
       const s = this.slots[Number(thumb.dataset.index)];
       if (s) this.paint(thumb, s);
     }
+    const mergedThumb = this.filmstrip.querySelector<HTMLCanvasElement>('canvas[data-merged]');
+    if (mergedThumb) this.paintMerged(mergedThumb, true);
   }
 
   private renderFilmstrip(): void {
-    const cards = this.displayOrder().map((i) => {
+    const cards: HTMLElement[] = [];
+    if (this.lookInfo) {
+      cards.push(
+        h(
+          'button',
+          { type: 'button', class: 'thumb merged final', role: 'option', 'aria-selected': String(this.selected === FINAL), 'data-testid': 'thumb-final', onclick: () => this.select(FINAL) },
+          h('canvas', { 'data-final': 'true', 'aria-hidden': 'true' }),
+          h('div', { class: 'thumb-row' }, h('span', { class: 'thumb-name' }, 'Final'), h('span', { class: 'badge' }, 'Real estate')),
+          h('div', { class: 'thumb-row secondary' }, h('span', {}, 'colour, tone, finishing'), h('span', {}, 'export-ready')),
+        ),
+      );
+    }
+    if (this.merge) {
+      cards.push(
+        h(
+          'button',
+          { type: 'button', class: 'thumb merged', role: 'option', 'aria-selected': String(this.selected === MERGED), 'data-testid': 'thumb-merged', onclick: () => this.select(MERGED) },
+          h('canvas', { 'data-merged': 'true', 'aria-hidden': 'true' }),
+          h('div', { class: 'thumb-row' }, h('span', { class: 'thumb-name' }, 'Merged HDR'), h('span', { class: 'badge' }, `${this.merge.dynamicRangeStops.toFixed(1)} stops`)),
+          h('div', { class: 'thumb-row secondary' }, h('span', {}, `${this.slots.filter((s) => s.info).length} frames`), h('span', {}, 'aligned · noise-weighted')),
+        ),
+      );
+    } else if (this.exposures && !this.mergeError) {
+      cards.push(h('div', { class: 'thumb pending merged', role: 'option', 'aria-selected': 'false' }, h('div', { class: 'thumb-placeholder' }), h('div', { class: 'thumb-name' }, 'Merging…')));
+    }
+    for (const i of this.displayOrder()) {
       const slot = this.slots[i];
       const e = this.exposures?.byFile.get(i);
       const isRef = this.exposures?.reference === i;
       if (slot.error) {
-        return h(
-          'div',
-          { class: 'thumb error', role: 'option', 'aria-selected': 'false', 'data-testid': 'thumb' },
-          h('div', { class: 'thumb-error' }, h('strong', {}, 'Could not read this file'), h('span', {}, slot.error)),
-          h('div', { class: 'thumb-name' }, slot.fileName),
+        cards.push(
+          h(
+            'div',
+            { class: 'thumb error', role: 'option', 'aria-selected': 'false', 'data-testid': 'thumb' },
+            h('div', { class: 'thumb-error' }, h('strong', {}, 'Could not read this file'), h('span', {}, slot.error)),
+            h('div', { class: 'thumb-name' }, slot.fileName),
+          ),
         );
+        continue;
       }
       if (!slot.info || !slot.hist) {
-        return h('div', { class: 'thumb pending', role: 'option', 'aria-selected': 'false', 'data-testid': 'thumb' }, h('div', { class: 'thumb-placeholder' }), h('div', { class: 'thumb-name' }, slot.fileName));
+        cards.push(h('div', { class: 'thumb pending', role: 'option', 'aria-selected': 'false', 'data-testid': 'thumb' }, h('div', { class: 'thumb-placeholder' }), h('div', { class: 'thumb-name' }, slot.fileName)));
+        continue;
       }
-      const canvas = h('canvas', { 'data-index': i, 'aria-hidden': 'true' });
-      const card = h(
-        'button',
-        {
-          type: 'button',
-          class: 'thumb',
-          role: 'option',
-          'aria-selected': String(i === this.selected),
-          'data-testid': 'thumb',
-          'data-file': slot.fileName,
-          onclick: () => this.select(i),
-        },
-        canvas,
-        h('div', { class: 'thumb-row' }, h('span', { class: 'thumb-name' }, stem(slot.fileName)), isRef ? h('span', { class: 'badge' }, 'Base') : null),
+      cards.push(
         h(
-          'div',
-          { class: 'thumb-row secondary' },
-          h('span', {}, fmt.shutter(slot.info.exposure.exposureTime)),
-          h('span', { class: 'thumb-ev' }, e ? fmt.ev(e.measuredEv) : `${fmt.signed(slot.info.exposure.exposureCompensation, 1)} EV offset`),
+          'button',
+          { type: 'button', class: 'thumb', role: 'option', 'aria-selected': String(i === this.selected), 'data-testid': 'thumb', 'data-file': slot.fileName, onclick: () => this.select(i) },
+          h('canvas', { 'data-index': i, 'aria-hidden': 'true' }),
+          h('div', { class: 'thumb-row' }, h('span', { class: 'thumb-name' }, stem(slot.fileName)), isRef ? h('span', { class: 'badge' }, 'Base') : null),
+          h(
+            'div',
+            { class: 'thumb-row secondary' },
+            h('span', {}, fmt.shutter(slot.info.exposure.exposureTime)),
+            h('span', { class: 'thumb-ev' }, e ? fmt.ev(e.measuredEv) : `${fmt.signed(slot.info.exposure.exposureCompensation, 1)} EV offset`),
+          ),
+          histogramChart(slot.hist, { width: 164, rowHeight: 11, compact: true }),
         ),
-        histogramChart(slot.hist, { width: 164, rowHeight: 11, compact: true }),
       );
-      return card;
-    });
+    }
     replace(this.filmstrip, ...cards);
   }
 
+  private kpi(label: string, value: string, testId: string, note?: string): HTMLElement {
+    return h('div', { class: 'kpi' }, h('span', { class: 'kpi-label' }, label), h('span', { class: 'kpi-value', 'data-testid': testId }, value), note ? h('span', { class: 'kpi-note' }, note) : null);
+  }
+
   private renderInspector(): void {
+    if (this.selected === FINAL && this.lookInfo && this.lookSettings) {
+      this.renderLookInspector(this.lookInfo, this.lookSettings);
+      return;
+    }
+    if (this.selected === MERGED && this.merge && this.exposures) {
+      this.renderMergedInspector(this.merge, this.exposures);
+      return;
+    }
     const slot = this.slots[this.selected];
     if (!slot) {
       replace(this.inspector, h('p', { class: 'muted' }, 'Decoding…'));
@@ -486,10 +1079,6 @@ class App {
     }
     const e = this.exposures?.byFile.get(slot.index);
     const ex = info.exposure;
-    const total = this.slots.length;
-    const kpi = (label: string, value: string, testId: string, note?: string): HTMLElement =>
-      h('div', { class: 'kpi' }, h('span', { class: 'kpi-label' }, label), h('span', { class: 'kpi-value', 'data-testid': testId }, value), note ? h('span', { class: 'kpi-note' }, note) : null);
-
     const width = Math.max(240, this.inspector.clientWidth - 32 || 340);
     const channelRows = stats.channels.map((c) =>
       h(
@@ -503,26 +1092,16 @@ class App {
       ),
     );
     const wb = info.asShotWb ? wbGains(info) : null;
-
     replace(
       this.inspector,
-      h(
-        'div',
-        { class: 'inspector-head' },
-        h('h2', { 'data-testid': 'inspector-title' }, info.fileName),
-        this.exposures?.reference === slot.index ? h('span', { class: 'badge' }, 'Base exposure') : null,
-      ),
-      h(
-        'p',
-        { class: 'meta-line' },
-        `Shot ${info.sequenceNumber ?? '?'} of ${total} · ${fmt.shutter(ex.exposureTime)} · f/${ex.fNumber} · ISO ${ex.iso} · ${ex.focalLength} mm`,
-      ),
+      h('div', { class: 'inspector-head' }, h('h2', { 'data-testid': 'inspector-title' }, info.fileName), this.exposures?.reference === slot.index ? h('span', { class: 'badge' }, 'Base exposure') : null),
+      h('p', { class: 'meta-line' }, `Shot ${info.sequenceNumber ?? '?'} of ${this.slots.length} · ${fmt.shutter(ex.exposureTime)} · f/${ex.fNumber} · ISO ${ex.iso} · ${ex.focalLength} mm`),
       h(
         'div',
         { class: 'kpis' },
-        kpi('Measured', e ? fmt.ev(e.measuredEv) : '…', 'kpi-measured', 'from pixels'),
-        kpi('EXIF shutter', e ? fmt.ev(e.exifEv) : '…', 'kpi-exif', 'from tags'),
-        kpi('Difference', e ? fmt.ev(e.differenceEv) : '…', 'kpi-diff', 'measured − EXIF'),
+        this.kpi('Measured', e ? fmt.ev(e.measuredEv) : '…', 'kpi-measured', 'from pixels'),
+        this.kpi('EXIF shutter', e ? fmt.ev(e.exifEv) : '…', 'kpi-exif', 'from tags'),
+        this.kpi('Difference', e ? fmt.ev(e.differenceEv) : '…', 'kpi-diff', 'measured − EXIF'),
       ),
       h('h3', {}, 'Histogram', h('span', { class: 'h3-note' }, 'stops below white level')),
       histogramChart(slot.hist, { width, rowHeight: 34, label: `Raw histogram of ${info.fileName}` }),
@@ -543,6 +1122,258 @@ class App {
         h('dd', {}, info.sr2WhiteLevel ? [...new Set(info.sr2WhiteLevel)].join(' / ') : '—', h('span', { class: 'src' }, 'not a clip')),
         h('dt', {}, 'As-shot WB'),
         h('dd', {}, wb ? `R ${wb[0].toFixed(3)} · B ${wb[2].toFixed(3)}` : '—', h('span', { class: 'src' }, info.sources.asShotWb ?? '')),
+      ),
+    );
+  }
+
+  private renderLookInspector(info: NonNullable<App['lookInfo']>, initial: LookSettings): void {
+    // Slider drags only update their label and the settings: rebuilding the panel would end the drag.
+    const current = (): LookSettings => this.lookSettings ?? initial;
+    const apply = (patch: Partial<LookSettings>): void => {
+      this.lookSettings = { ...current(), ...patch };
+      this.requestLook();
+      this.renderImages();
+    };
+    const pct = (v: number): string => `${Math.round(v * 100)}%`;
+    const wbNote = h('span', { class: 'h3-note' });
+    const wbButtons = new Map<WbMode, HTMLButtonElement>();
+    const setMode = (mode: WbMode): void => {
+      this.wbMode = mode;
+      for (const [m, b] of wbButtons) b.setAttribute('aria-pressed', String(m === mode));
+      wbNote.textContent = mode === 'auto' ? `walls neutral · ${pct(info.wb.auto.coverage)} of the room` : mode === 'custom' ? 'custom' : 'camera preset';
+    };
+    const row = (label: string, testId: string, min: number, max: number, step: number, value: number, format: (v: number) => string, onInput: (v: number) => void): HTMLElement => {
+      const out = h('output', { class: 'look-value', 'data-testid': `${testId}-value` }, format(value));
+      const input = h('input', { type: 'range', min, max, step, value, 'data-testid': testId });
+      input.addEventListener('input', () => {
+        const v = Number(input.value);
+        onInput(v);
+        out.textContent = format(v);
+      });
+      return h('label', { class: 'look-row' }, h('span', { class: 'look-label' }, label), input, out);
+    };
+    const presets: Array<[WbMode, string, WbSetting | null]> = [
+      ['auto', 'Auto', info.wb.auto],
+      ['asShot', 'As shot', info.wb.asShot],
+      ['camera', 'Camera', info.wb.camera],
+    ];
+    for (const [mode, label, wb] of presets) {
+      wbButtons.set(
+        mode,
+        h(
+          'button',
+          {
+            type: 'button',
+            disabled: !wb,
+            'data-testid': `wb-${mode}`,
+            onclick: () => {
+              if (!wb) return;
+              this.lookSettings = { ...current(), wb: { temperature: wb.temperature, tint: wb.tint } };
+              this.wbMode = mode;
+              this.requestLook(0);
+              this.renderInspector();
+            },
+          },
+          label,
+        ),
+      );
+    }
+    const s = current();
+    const signed2 = (v: number): string => fmt.signed(v, 2);
+    const toggle = (label: string, testId: string, checked: boolean, disabled: boolean, onChange: (on: boolean) => void, note?: string): HTMLElement => {
+      const box = h('input', { type: 'checkbox', checked, disabled, 'data-testid': testId });
+      box.addEventListener('change', () => onChange(box.checked));
+      return h('label', { class: 'toggle look-toggle' }, box, h('span', {}, label), note ? h('span', { class: 'toggle-note' }, note) : null);
+    };
+    replace(
+      this.inspector,
+      h('div', { class: 'inspector-head' }, h('h2', { 'data-testid': 'inspector-title' }, 'Final'), h('span', { class: 'badge' }, 'Real estate')),
+      h('p', { class: 'meta-line' }, `${info.profile} colour · bright & airy tone`),
+      h('h3', {}, 'White balance', wbNote),
+      h('div', { class: 'segmented wide', role: 'group', 'aria-label': 'White balance' }, ...wbButtons.values()),
+      row('Temp', 'look-temp', 0, 1000, 1, tempToSlider(s.wb.temperature), (v) => `${Math.round(sliderToTemp(v))} K`, (v) => {
+        setMode('custom');
+        apply({ wb: { ...current().wb, temperature: sliderToTemp(v) } });
+      }),
+      row('Tint', 'look-tint', -50, 80, 1, Math.round(s.wb.tint), (v) => fmt.signed(v, 0), (v) => {
+        setMode('custom');
+        apply({ wb: { ...current().wb, tint: v } });
+      }),
+      h('h3', {}, 'Tone'),
+      row('Brightness', 'look-brightness', -1, 1.5, 0.05, s.brightness, signed2, (v) => apply({ brightness: v })),
+      row('Window pull', 'look-window', 0, 1, 0.05, s.windowPull, pct, (v) => apply({ windowPull: v })),
+      row('Contrast', 'look-contrast', -0.5, 0.6, 0.05, s.contrast, signed2, (v) => apply({ contrast: v })),
+      h('h3', {}, 'Colour'),
+      row('Vibrance', 'look-vibrance', -0.5, 0.6, 0.05, s.vibrance, signed2, (v) => apply({ vibrance: v })),
+      row('Clean whites', 'look-whites', 0, 1, 0.05, s.cleanWhites, pct, (v) => apply({ cleanWhites: v })),
+      h('h3', {}, 'Geometry', h('span', { class: 'h3-note' }, uprightNote(info.upright))),
+      toggle('Straighten verticals', 'look-upright', s.upright, !info.upright.available, (on) => apply({ upright: on })),
+      toggle('Lens corrections', 'look-lens', s.lens, !info.lens.available, (on) => apply({ lens: on }), lensNote(info.lens)),
+      h(
+        'div',
+        { class: 'look-actions' },
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'button',
+            'data-testid': 'look-reset',
+            onclick: () => {
+              this.lookSettings = this.defaultLook();
+              this.wbMode = 'auto';
+              this.requestLook(0);
+              this.renderInspector();
+            },
+          },
+          'Reset to real-estate default',
+        ),
+      ),
+      h('p', { class: 'muted small', 'data-testid': 'look-status' }),
+    );
+    setMode(this.wbMode);
+    this.renderLookStatus();
+  }
+
+  private renderMergedInspector(merge: MergeSummary, exposures: Exposures): void {
+    const worstSeam = Math.max(...merge.seams.map((s) => Math.abs(s.relativeBias)).filter(Number.isFinite), 0);
+    const maxShare = Math.max(...merge.weightShare);
+    const bars = exposures.order.map((file, rank) => {
+      const position = exposures.files.indexOf(file);
+      const share = merge.weightShare[position] ?? 0;
+      const info = this.slots[file].info;
+      return h(
+        'div',
+        { class: 'bar-row', title: `${this.slots[file].fileName}: ${fmt.percent(share, 1)} of the weight` },
+        h('span', { class: 'bar-label' }, info ? fmt.shutter(info.exposure.exposureTime) : stem(this.slots[file].fileName)),
+        h('span', { class: 'bar-track' }, h('span', { class: 'bar', style: `width:${(100 * share) / maxShare}%;background:${css(FRAME_COLORS[rank % FRAME_COLORS.length])}` })),
+        h('span', { class: 'bar-value' }, fmt.percent(share, 1)),
+      );
+    });
+    replace(
+      this.inspector,
+      h('div', { class: 'inspector-head' }, h('h2', { 'data-testid': 'inspector-title' }, 'Merged HDR'), h('span', { class: 'badge' }, 'Phase 4')),
+      h('p', { class: 'meta-line' }, `${exposures.order.length} frames · ${merge.width} × ${merge.height} · aligned to ${stem(this.slots[exposures.reference].fileName)}`),
+      h(
+        'div',
+        { class: 'kpis' },
+        this.kpi('Dynamic range', `${merge.dynamicRangeStops.toFixed(1)} stops`, 'kpi-range', 'brightest ÷ noise floor'),
+        this.kpi('Still clipped', fmt.percent(merge.clippedFraction, 3), 'kpi-clipped', 'all frames clipped'),
+        this.kpi('Worst seam', fmt.percent(worstSeam, 2), 'kpi-seam', 'mean step at a hand-off'),
+      ),
+      h('h3', {}, 'Weight share', h('span', { class: 'h3-note' }, 'how much each frame contributes')),
+      h('div', { class: 'bars', 'data-testid': 'weight-bars' }, ...bars),
+      h(
+        'p',
+        { class: 'muted small' },
+        'Each pixel averages every usable frame, weighted by the noise model: longer exposures win wherever they are unclipped, and a frame fades out smoothly as it nears clipping.',
+      ),
+    );
+  }
+
+  /** Moving objects: the deghosting switch and how much of each frame it set aside. */
+  private deghostSection(merge: MergeSummary, exposures: Exposures): HTMLElement {
+    const d = merge.deghost;
+    const box = h('input', { type: 'checkbox', checked: d.enabled, 'data-testid': 'deghost-toggle' });
+    box.addEventListener('change', () => this.remerge(box.checked));
+    const perFrame = exposures.order
+      .filter((file) => file !== exposures.reference)
+      .map((file) => `${stem(this.slots[file].fileName)} ${fmt.percent(d.share[exposures.files.indexOf(file)] ?? 0, 2)}`)
+      .join(' · ');
+    const summary = d.enabled
+      ? d.coverage > 0
+        ? `Frames disagreed with the base frame in ${fmt.percent(d.coverage, 2)} of the image (wind, people, passing cars, changing light); there the base frame is used alone. Per frame: ${perFrame}.`
+        : 'No moving objects found: every frame agrees with the base frame within its noise.'
+      : 'Off: every frame contributes everywhere, so anything that moved between shots can leave a faint copy.'
+    return h(
+      'div',
+      { class: 'deghost', 'data-testid': 'deghost' },
+      h('h3', { class: 'panel-h3' }, 'Moving objects', h('span', { class: 'h3-note' }, d.enabled ? `checked in ${Math.round(d.ms)} ms` : 'deghosting off')),
+      h('label', { class: 'toggle' }, box, h('span', {}, 'Deghost: keep moving objects from the base frame only')),
+      h('p', { class: 'muted small', 'data-testid': 'deghost-summary' }, summary),
+    );
+  }
+
+  private renderMerge(): void {
+    const head = [h('h2', {}, 'Merge')];
+    const merge = this.merge;
+    const exposures = this.exposures;
+    if (!merge || !exposures) {
+      head.push(h('p', { class: 'lead' }, this.mergeError ? `The merge failed: ${this.mergeError}` : 'Aligning and merging once the noise model is fitted…'));
+      replace(this.mergePanel, ...head);
+      return;
+    }
+    const fileAt = (position: number): number => exposures.files[position];
+    head.push(
+      h(
+        'p',
+        { class: 'lead' },
+        `Frames are aligned to the base frame with sub-pixel shifts measured from the image, resampled per colour plane, and averaged with noise-model weights on the raw Bayer data. Align ${Math.round(merge.ms.align)} ms · merge ${Math.round(merge.ms.merge)} ms.`,
+      ),
+    );
+    const alignRows = exposures.order.map((file) => {
+      const a = merge.alignment.frames[exposures.files.indexOf(file)];
+      const spread = Math.max(...a.quadrants.map((q) => Math.hypot(q.dx - a.shift.dx, q.dy - a.shift.dy)), 0);
+      const isRef = file === exposures.reference;
+      return h(
+        'tr',
+        { 'data-file': this.slots[file].fileName },
+        h('th', { scope: 'row' }, stem(this.slots[file].fileName), isRef ? h('span', { class: 'badge' }, 'Base') : null),
+        h('td', { class: 'num' }, fmt.shutter(this.slots[file].info?.exposure.exposureTime ?? NaN)),
+        h('td', { class: 'num strong' }, isRef ? '—' : fmt.signed(a.shift.dx, 3)),
+        h('td', { class: 'num strong' }, isRef ? '—' : fmt.signed(a.shift.dy, 3)),
+        h('td', { class: 'num' }, isRef ? '—' : spread.toFixed(3)),
+        h('td', { class: 'num' }, isRef ? '—' : `${a.residualBefore.toFixed(2)} → ${a.residualAfter.toFixed(2)}`),
+        h('td', {}, a.unreliable ? 'low texture, check' : isRef ? 'reference' : 'ok'),
+      );
+    });
+    const seamRows = merge.seams.map((s) => {
+      const cells = s.cells.filter((c) => c.samples >= 500);
+      const worst = cells.reduce((m, c) => (Math.abs(c.relativeBias) > Math.abs(m) ? c.relativeBias : m), 0);
+      return h(
+        'tr',
+        {},
+        h('th', { scope: 'row' }, `${stem(this.slots[fileAt(s.bright)].fileName)} → ${stem(this.slots[fileAt(s.dark)].fileName)}`),
+        h('td', { class: 'num' }, fmt.integer(s.samples)),
+        h('td', { class: 'num strong' }, fmt.signedPercent(s.relativeBias, 2)),
+        h('td', { class: 'num' }, cells.length ? fmt.signedPercent(worst, 2) : '—'),
+        h('td', { class: 'num' }, String(cells.length)),
+      );
+    });
+    replace(
+      this.mergePanel,
+      ...head,
+      this.deghostSection(merge, exposures),
+      h('h3', { class: 'panel-h3' }, 'Alignment', h('span', { class: 'h3-note' }, 'shift in raw pixels; residual = robust RMS of noise-normalised differences (1 = noise only)')),
+      h(
+        'table',
+        { class: 'data', 'data-testid': 'alignment-table' },
+        h(
+          'thead',
+          {},
+          h(
+            'tr',
+            {},
+            h('th', {}, 'Frame'),
+            h('th', { class: 'num' }, 'Shutter'),
+            h('th', { class: 'num' }, 'Shift x (px)'),
+            h('th', { class: 'num' }, 'Shift y (px)'),
+            h('th', { class: 'num' }, 'Quadrant spread (px)'),
+            h('th', { class: 'num' }, 'Residual'),
+            h('th', {}, 'Status'),
+          ),
+        ),
+        h('tbody', {}, ...alignRows),
+      ),
+      h('h3', { class: 'panel-h3' }, 'Seam check', h('span', { class: 'h3-note' }, 'mean step where weight hands off from a frame nearing clip to the next darker frame; flat areas only'), ),
+      h(
+        'table',
+        { class: 'data', 'data-testid': 'seam-table' },
+        h(
+          'thead',
+          {},
+          h('tr', {}, h('th', {}, 'Hand-off'), h('th', { class: 'num' }, 'Samples'), h('th', { class: 'num' }, 'Mean step'), h('th', { class: 'num' }, 'Worst region'), h('th', { class: 'num' }, 'Regions')),
+        ),
+        h('tbody', {}, ...seamRows),
       ),
     );
   }
@@ -613,7 +1444,7 @@ class App {
       return h(
         'tr',
         {},
-        h('th', { scope: 'row' }, `${stem(this.slots[p.brightFile].fileName)} ÷ ${stem(this.slots[p.darkFile].fileName)}`),
+        h('th', { scope: 'row' }, this.pairLabel(p.brightFile, p.darkFile)),
         h('td', { class: 'num' }, `${p.exifRatio.toFixed(3)}×`),
         h('td', { class: 'num strong' }, `${est.ratio.toFixed(3)}×`),
         h('td', { class: 'num' }, fmt.signedPercent(est.ratio / p.exifRatio - 1, 1)),
@@ -831,6 +1662,16 @@ class App {
   }
 }
 
+function lensNote(l: LensInfo): string {
+  if (!l.available) return 'no correction data in the file';
+  return `vignetting ${l.vignetting.toFixed(1)} EV · distortion ${l.distortion.toFixed(1)}% · CA ${l.ca.toFixed(1)} px`;
+}
+
+function uprightNote(u: UprightInfo): string {
+  if (!u.available) return u.lines ? `already level · ${u.lines} vertical lines` : 'not enough vertical lines';
+  return `camera tilted ${fmt.signed(u.pitch, 1)}°, roll ${fmt.signed(u.roll, 1)}° · keeps ${Math.round(u.keep * 100)}%`;
+}
+
 function leadText(exposures: Exposures | null, error: string): string {
   if (error) return `Exposure ratios could not be measured: ${error}`;
   if (!exposures) return 'Measuring exposure ratios once every frame is decoded…';
@@ -844,6 +1685,7 @@ function toExposures(indices: number[], analysis: ExposureAnalysis, ms: number):
     order: analysis.order.map((k) => indices[k]),
     reference: indices[analysis.reference],
     pairs: analysis.pairs.map((p) => ({ ...p, brightFile: indices[p.bright], darkFile: indices[p.dark] })),
+    files: indices,
     ms,
   };
 }

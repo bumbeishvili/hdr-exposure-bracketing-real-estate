@@ -35,6 +35,7 @@ const TAG = {
   MakerNote: 0x927c,
   SubSecTimeOriginal: 0x9291,
   ExposureMode: 0xa402,
+  FocalLengthIn35mmFormat: 0xa405,
   LensModel: 0xa434,
   // Sony raw IFD
   SonyRawFileType: 0x7000,
@@ -42,6 +43,9 @@ const TAG = {
   SonyWbRggb: 0x7313,
   SonyCropTopLeft: 0x74c7,
   SonyCropSize: 0x74c8,
+  SonyVignettingParams: 0x7032,
+  SonyCaParams: 0x7035,
+  SonyDistortionParams: 0x7037,
   // Sony MakerNote
   ReleaseMode: 0xb049,
   SequenceNumber: 0xb04a,
@@ -88,6 +92,8 @@ export interface ExposureInfo {
   subSecTimeOriginal: string;
   /** Millimetres. */
   focalLength: number;
+  /** 35 mm-equivalent focal length, millimetres (NaN if the file does not say). */
+  focalLength35mm: number;
   lensModel: string;
   /** Exif ExposureMode: 0 auto, 1 manual, 2 auto bracket. */
   exposureMode: number;
@@ -137,6 +143,16 @@ export interface RawFrame {
   sequenceNumber: number | null;
   releaseMode: string | null;
   sr2: Sr2Block | null;
+  /** Sony's embedded lens-correction knots (raw values, count stripped), if present. */
+  lensCorrection: LensCorrectionParams | null;
+}
+
+export interface LensCorrectionParams {
+  distortion: number[] | null;
+  vignetting: number[] | null;
+  /** Lateral chromatic aberration, red and blue halves. */
+  caRed: number[] | null;
+  caBlue: number[] | null;
 }
 
 export class ArwError extends Error {
@@ -226,6 +242,7 @@ export function readArw(input: ArrayBuffer | Uint8Array, fileName = ''): RawFram
     exposure: readExposure(r, exif),
     ...makerNote,
     sr2,
+    lensCorrection: readLensCorrection(r, raw),
   };
 }
 
@@ -345,9 +362,24 @@ function readExposure(r: TiffReader, exif: Ifd | null): ExposureInfo {
     dateTimeOriginal: getText(TAG.DateTimeOriginal),
     subSecTimeOriginal: getText(TAG.SubSecTimeOriginal),
     focalLength: get(TAG.FocalLength),
+    focalLength35mm: get(TAG.FocalLengthIn35mmFormat),
     lensModel: getText(TAG.LensModel),
     exposureMode: get(TAG.ExposureMode),
   };
+}
+
+/** Sony lens-correction tags: a count followed by that many knots (CA: red half, then blue). */
+function readLensCorrection(r: TiffReader, raw: Ifd): LensCorrectionParams | null {
+  const knots = (tag: number): number[] | null => {
+    const v = nums(r, raw, tag);
+    return v.length > 1 && v[0] === v.length - 1 ? v.slice(1) : null;
+  };
+  const distortion = knots(TAG.SonyDistortionParams);
+  const vignetting = knots(TAG.SonyVignettingParams);
+  const ca = knots(TAG.SonyCaParams);
+  if (!distortion && !vignetting && !ca) return null;
+  const half = ca ? ca.length / 2 : 0;
+  return { distortion, vignetting, caRed: ca ? ca.slice(0, half) : null, caBlue: ca ? ca.slice(half) : null };
 }
 
 /** Bracket position and release mode from the (unencrypted) Sony MakerNote IFD. */

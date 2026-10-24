@@ -55,14 +55,17 @@ export class TiffReader {
     this.base = base;
   }
 
-  /** Validates the TIFF header and returns a reader plus the IFD0 offset. */
-  static open(bytes: Uint8Array): { reader: TiffReader; firstIfd: number } {
+  /**
+   * Validates the header and returns a reader plus the IFD0 offset. `magic`
+   * lists accepted magic numbers: 42 for TIFF; DNG camera profiles (.dcp) use 0x4352.
+   */
+  static open(bytes: Uint8Array, magic: readonly number[] = [42]): { reader: TiffReader; firstIfd: number } {
     if (bytes.byteLength < 8) throw new TiffError('File is too small to be a TIFF');
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const order = view.getUint16(0, false);
     if (order !== 0x4949 && order !== 0x4d4d) throw new TiffError('Not a TIFF file (no II/MM byte-order mark)');
     const le = order === 0x4949;
-    if (view.getUint16(2, le) !== 42) throw new TiffError('Not a TIFF file (bad magic number)');
+    if (!magic.includes(view.getUint16(2, le))) throw new TiffError('Not a TIFF file (bad magic number)');
     return { reader: new TiffReader(view, le), firstIfd: view.getUint32(4, le) };
   }
 

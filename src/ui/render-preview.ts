@@ -10,6 +10,12 @@ export interface RenderOptions {
   /** R, G, B multipliers, green = 1. */
   wb: readonly [number, number, number];
   showClipping: boolean;
+  /** 'linear' clips at 1.0; 'global' compresses highlights so `whitePoint` maps to 1.0. */
+  tone?: 'linear' | 'global';
+  /** Luminance (after gain) that the global curve maps to white. */
+  whitePoint?: number;
+  /** Per-pixel overlay: an index into `colors`, blended at 50%; 255 = none. */
+  overlay?: { index: Uint8Array; colors: ReadonlyArray<readonly [number, number, number]> } | null;
 }
 
 /** Overlay colours: status "serious" for some channels clipped, "critical" for all. */
@@ -29,14 +35,36 @@ const SRGB = (() => {
 export function renderPreview(p: PreviewData, opt: RenderOptions, out: ImageData): void {
   const { rgb, clip } = p;
   const data = out.data;
-  const kr = opt.gain * opt.wb[0] * LUT_SIZE;
-  const kg = opt.gain * opt.wb[1] * LUT_SIZE;
-  const kb = opt.gain * opt.wb[2] * LUT_SIZE;
+  const kr = opt.gain * opt.wb[0];
+  const kg = opt.gain * opt.wb[1];
+  const kb = opt.gain * opt.wb[2];
+  const global = opt.tone === 'global';
+  const inv2 = 1 / Math.max(opt.whitePoint ?? 1, 1) ** 2;
+  const overlay = opt.overlay;
   const n = p.width * p.height;
   for (let i = 0, j = 0; i < n; i++, j += 4) {
-    let r = SRGB[lutIndex(rgb[3 * i] * kr)];
-    let g = SRGB[lutIndex(rgb[3 * i + 1] * kg)];
-    let b = SRGB[lutIndex(rgb[3 * i + 2] * kb)];
+    let lr = rgb[3 * i] * kr;
+    let lg = rgb[3 * i + 1] * kg;
+    let lb = rgb[3 * i + 2] * kb;
+    if (global) {
+      // Extended Reinhard on luminance; scaling RGB together keeps hue.
+      const y = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+      if (y > 0) {
+        const k = (1 + y * inv2) / (1 + y);
+        lr *= k;
+        lg *= k;
+        lb *= k;
+      }
+    }
+    let r = SRGB[lutIndex(lr * LUT_SIZE)];
+    let g = SRGB[lutIndex(lg * LUT_SIZE)];
+    let b = SRGB[lutIndex(lb * LUT_SIZE)];
+    if (overlay && overlay.index[i] !== 255) {
+      const c = overlay.colors[overlay.index[i]];
+      r = (r + c[0]) >> 1;
+      g = (g + c[1]) >> 1;
+      b = (b + c[2]) >> 1;
+    }
     if (opt.showClipping && clip[i]) {
       const c = clip[i] === 7 ? FULL : PARTIAL;
       r = (r * 0.25 + c[0] * 0.75) | 0;
@@ -52,6 +80,17 @@ export function renderPreview(p: PreviewData, opt: RenderOptions, out: ImageData
 
 function lutIndex(v: number): number {
   return v <= 0 ? 0 : v >= LUT_SIZE ? LUT_SIZE : v | 0;
+}
+
+/** Luminance percentile `q` (after WB and gain), for choosing the global curve's white point. */
+export function luminancePercentile(p: PreviewData, wb: readonly [number, number, number], gain: number, q: number): number {
+  const step = Math.max(1, Math.floor((p.width * p.height) / 100000));
+  const ys: number[] = [];
+  for (let i = 0; i < p.width * p.height; i += step) {
+    ys.push(gain * (0.2126 * p.rgb[3 * i] * wb[0] + 0.7152 * p.rgb[3 * i + 1] * wb[1] + 0.0722 * p.rgb[3 * i + 2] * wb[2]));
+  }
+  ys.sort((a, b) => a - b);
+  return ys[Math.min(ys.length - 1, Math.floor(q * ys.length))] ?? 1;
 }
 
 /** Gain that maps the log-average luminance of unclipped pixels to middle grey. */

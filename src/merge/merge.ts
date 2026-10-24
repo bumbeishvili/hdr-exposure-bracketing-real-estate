@@ -13,6 +13,7 @@ import type { ExposureAnalysis } from '../analysis/exposure.ts';
 import { shotFactor, type NoiseModel } from '../analysis/noise.ts';
 import type { PreviewData } from '../analysis/preview.ts';
 import type { AlignmentResult } from './align.ts';
+import type { MotionMasks } from './deghost.ts';
 
 export interface MergeOptions {
   /** Fraction of a frame's range where its weight starts rolling off… */
@@ -24,6 +25,8 @@ export interface MergeOptions {
   /** Shifts smaller than this (raw px) are not resampled. */
   minShift?: number;
   previewMaxWidth?: number;
+  /** Deghosting: per-frame weight multipliers from `detectMotion`. */
+  motion?: MotionMasks | null;
 }
 
 export interface MergedImage {
@@ -40,17 +43,6 @@ export interface MergedImage {
   referenceRange: number;
 }
 
-export interface SeamCheck {
-  bright: number;
-  dark: number;
-  /** Samples where the brighter frame was in its roll-off zone and the darker one usable. */
-  samples: number;
-  /** Mean (bright − dark) radiance difference there, relative to the signal. */
-  relativeBias: number;
-  /** The same bias in units of its standard error. */
-  z: number;
-}
-
 export interface MergeResult {
   image: MergedImage;
   /** Linear camera RGB, 1.0 = the reference frame's white level. */
@@ -59,11 +51,12 @@ export interface MergeResult {
   sourceMap: Uint8Array;
   /** Share of all weight each frame contributed (input order). */
   weightShare: number[];
-  seams: SeamCheck[];
   /** Fraction of samples where every frame was clipped. */
   clippedFraction: number;
   /** log2(brightest merged signal / read-noise floor of the brightest frame). */
   dynamicRangeStops: number;
+  /** Per preview pixel, 0–255: how much weight deghosting took away from the frames there. */
+  ghostMap: Uint8Array | null;
 }
 
 interface Source {
@@ -157,10 +150,6 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
   for (const c of cfaColors) perColor[c] += pf * pf;
 
   const shareSum = new Float64Array(nS);
-  const seamN = new Float64Array(nS);
-  const seamD = new Float64Array(nS);
-  const seamVar = new Float64Array(nS);
-  const seamX = new Float64Array(nS);
   let clippedSamples = 0;
   let maxSignal = 0;
 
@@ -169,7 +158,20 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
   const ws = new Float64Array(nS);
   const tapClip = new Uint8Array(nS);
 
+  const motion = opts.motion ?? null;
+  const rowWeights = motion ? sources.map(() => new Float32Array(motion.cols)) : null;
+
   for (let y = 0; y < H; y++) {
+    if (motion && rowWeights) {
+      const fy = Math.min(Math.max(y / motion.block - 0.5, 0), motion.rows - 1);
+      const y0 = Math.min(Math.floor(fy), motion.rows - 2);
+      const ty = fy - y0;
+      sources.forEach((src, k) => {
+        const w = motion.weights[src.index];
+        const out = rowWeights[k];
+        for (let bx = 0; bx < motion.cols; bx++) out[bx] = w[y0 * motion.cols + bx] * (1 - ty) + w[(y0 + 1) * motion.cols + bx] * ty;
+      });
+    }
     const Y = crop.top + y;
     const py = Y & 1;
     const V = Y >> 1;
@@ -235,6 +237,13 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
           const t = (v - lo) / (s.rollHi[p] - lo);
           w *= 1 - t * t * (3 - 2 * t);
         }
+        if (rowWeights && motion) {
+          const fx = Math.min(Math.max(x / motion.block - 0.5, 0), motion.cols - 1);
+          const x0 = Math.min(fx | 0, motion.cols - 2);
+          const tx = fx - x0;
+          const rw = rowWeights[k];
+          w *= rw[x0] * (1 - tx) + rw[x0 + 1] * tx;
+        }
         ws[k] = w;
         sw += w;
         swx += w * xs[k];
@@ -257,20 +266,6 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
       }
       data[idx] = value;
       if (value > maxSignal) maxSignal = value;
-
-      // Seam check: brighter frame in its roll-off zone vs the next darker usable frame.
-      for (let k = 0; k + 1 < used; k++) {
-        const s = sources[k];
-        if (ws[k] <= 0 || ws[k + 1] <= 0 || raws[k] <= s.rollLo[p]) continue;
-        const d = xs[k] - xs[k + 1];
-        const vk = (ch.alpha * s.shot * xHat * s.exposure + ch.beta) / (s.exposure * s.exposure);
-        const n = sources[k + 1];
-        const vn = (ch.alpha * n.shot * xHat * n.exposure + ch.beta) / (n.exposure * n.exposure);
-        seamN[k]++;
-        seamD[k] += d;
-        seamVar[k] += vk + vn;
-        seamX[k] += xHat;
-      }
 
       if (inPreviewY) {
         const pcol = Math.floor((x >> 1) / pf);
@@ -303,16 +298,21 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
   const rgb = new Float32Array(pw * ph * 3);
   for (let o = 0; o < pw * ph; o++) for (let c = 0; c < 3; c++) rgb[o * 3 + c] = pSum[o * 3 + c] / perColor[c];
 
-  const seams: SeamCheck[] = [];
-  for (let k = 0; k + 1 < nS; k++) {
-    const n = seamN[k];
-    seams.push({
-      bright: sources[k].index,
-      dark: sources[k + 1].index,
-      samples: n,
-      relativeBias: n ? seamD[k] / seamX[k] : NaN,
-      z: n ? seamD[k] / Math.sqrt(seamVar[k]) : NaN,
-    });
+  // How much weight deghosting removed, per preview pixel.
+  let ghostMap: Uint8Array | null = null;
+  if (motion) {
+    ghostMap = new Uint8Array(pw * ph);
+    for (let oy = 0; oy < ph; oy++) {
+      for (let ox = 0; ox < pw; ox++) {
+        const x = (ox + 0.5) * 2 * pf;
+        const y = (oy + 0.5) * 2 * pf;
+        const fx = Math.min(Math.max(x / motion.block - 0.5, 0), motion.cols - 1);
+        const fy = Math.min(Math.max(y / motion.block - 0.5, 0), motion.rows - 1);
+        let removed = 0;
+        for (const w of motion.weights) removed = Math.max(removed, 1 - w[Math.round(fy) * motion.cols + Math.round(fx)]);
+        ghostMap[oy * pw + ox] = Math.round(255 * removed);
+      }
+    }
   }
 
   const brightest = sources[0];
@@ -322,8 +322,9 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
     preview: { width: pw, height: ph, rgb, clip: pClip },
     sourceMap,
     weightShare,
-    seams,
+
     clippedFraction: clippedSamples / (W * H),
     dynamicRangeStops: Math.log2(maxSignal / floor),
+    ghostMap,
   };
 }

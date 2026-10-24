@@ -57,10 +57,11 @@ function bracket(exposures: number[], gamma = 0): RawFrame[] {
       crop: { left: 0, top: 0, width, height },
       asShotWb: null,
       sources: { blackLevel: 'default', whiteLevel: 'default', asShotWb: null },
-      exposure: { exposureTime: e / 100, exposureTimeRational: [e, 100], fNumber: 8, iso: 100, exposureCompensation: NaN, dateTimeOriginal: '', subSecTimeOriginal: '', focalLength: 35, lensModel: '', exposureMode: 2 },
+      exposure: { exposureTime: e / 100, exposureTimeRational: [e, 100], fNumber: 8, iso: 100, exposureCompensation: NaN, dateTimeOriginal: '', subSecTimeOriginal: '', focalLength: 35, focalLength35mm: 35, lensModel: '', exposureMode: 2 },
       sequenceNumber: k + 1,
       releaseMode: null,
       sr2: null,
+      lensCorrection: null,
     };
   });
 }

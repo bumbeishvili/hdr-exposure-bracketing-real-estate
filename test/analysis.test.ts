@@ -56,12 +56,14 @@ function syntheticFrame(exposure: number, seed: number, overrides: Partial<RawFr
       dateTimeOriginal: '',
       subSecTimeOriginal: '',
       focalLength: 35,
+      focalLength35mm: 35,
       lensModel: '',
       exposureMode: 2,
     },
     sequenceNumber: null,
     releaseMode: null,
     sr2: null,
+    lensCorrection: null,
     ...overrides,
   };
 }

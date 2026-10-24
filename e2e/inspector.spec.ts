@@ -85,6 +85,9 @@ test('sorts the bracket by measured exposure and reads levels like exiftool', as
     expect(Math.abs(measured[i] - offset), `${fx['System:FileName']}`).toBeLessThan(0.03);
   });
 
+  // The finished look opens first; the base frame's own readout is one click away.
+  await expect(page.getByTestId('inspector-title')).toHaveText('Final');
+  await page.locator(`[data-testid="thumb"][data-file="${base['System:FileName']}"]`).click();
   await expect(page.getByTestId('inspector-title')).toHaveText(String(base['System:FileName']));
   await expect(page.getByTestId('black-level')).toContainText(String(base['SubIFD:BlackLevel']).split(' ')[0]);
   await expect(page.getByTestId('white-level')).toContainText(String(base['SubIFD:WhiteLevel']));
@@ -118,6 +121,7 @@ test('matched mode brings every frame to the base brightness', async ({ page }) 
   await openSamples(page);
   const canvas = page.getByTestId('viewer-canvas');
   const thumbs = page.getByTestId('filmstrip').getByTestId('thumb');
+  await thumbs.first().click();
   // The clipping overlay paints blown areas red, which would skew the luma medians.
   await page.keyboard.press('c');
   await expect(page.getByTestId('clip-toggle')).not.toBeChecked();
@@ -144,6 +148,104 @@ test('matched mode brings every frame to the base brightness', async ({ page }) 
   expect(errors).toEqual([]);
 });
 
+test('merges the bracket without seams and shows where each frame contributes', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openSamples(page);
+  await page.getByTestId('thumb-merged').click();
+  await expect(page.getByTestId('thumb-merged')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByTestId('viewer-canvas')).toHaveAttribute('data-file', 'merged');
+  expect(await medianLuma(page.getByTestId('viewer-canvas'))).toBeGreaterThan(20);
+
+  // Phase 4 check: every frame aligned, nothing left clipped, no step at any hand-off.
+  await expect(page.getByTestId('alignment-table').locator('tbody tr')).toHaveCount(samples.length);
+  await expect(page.getByTestId('kpi-clipped')).toHaveText('0.000%');
+  const steps = (await page.getByTestId('seam-table').locator('tbody tr td.strong').allTextContents()).map(parseEv);
+  expect(steps.length).toBe(samples.length - 1);
+  for (const s of steps) expect(Math.abs(s), `seam step ${s}%`).toBeLessThan(0.5);
+
+  await page.screenshot({ path: join(shotsDir, '07-merged.png') });
+  await page.keyboard.press('s');
+  await expect(page.getByTestId('source-legend')).toBeVisible();
+  await page.getByTestId('viewer-canvas').screenshot({ path: join(shotsDir, '08-merged-sources.png') });
+  await page.keyboard.press('s');
+  await page.getByTestId('tone-linear').click();
+  await page.getByTestId('viewer-canvas').screenshot({ path: join(shotsDir, '09-merged-linear.png') });
+  await page.getByTestId('merge-panel').screenshot({ path: join(shotsDir, '10-merge-panel.png') });
+  expect(errors).toEqual([]);
+});
+
+test('100% view demosaics the merged image with RCD on demand', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openSamples(page);
+  await page.getByTestId('thumb-merged').click();
+  const canvas = page.getByTestId('viewer-canvas');
+  await expect(canvas).toHaveAttribute('data-file', 'merged');
+  const box = (await canvas.boundingBox())!;
+  // Curtain hem and bed edge: the sharpest part of this frame (focus was set on the left side).
+  await page.mouse.click(box.x + box.width * 0.24, box.y + box.height * 0.74);
+  await expect(canvas).toHaveAttribute('data-view', 'crop');
+  await expect(canvas).toHaveAttribute('data-algorithm', 'rcd');
+  expect(await canvas.evaluate((c: HTMLCanvasElement) => c.width)).toBeGreaterThan(300);
+  expect(await medianLuma(canvas)).toBeGreaterThan(10);
+  await canvas.screenshot({ path: join(shotsDir, '11-crop-rcd.png') });
+
+  await page.getByTestId('demosaic-bilinear').click();
+  await expect(canvas).toHaveAttribute('data-algorithm', 'bilinear');
+  await canvas.screenshot({ path: join(shotsDir, '12-crop-bilinear.png') });
+
+  await page.getByTestId('zoom-fit').click();
+  await expect(canvas).toHaveAttribute('data-view', 'fit');
+  expect(errors).toEqual([]);
+});
+
+test('final look renders a bright real-estate image and exports a JPEG', async ({ page }) => {
+  const errors = collectErrors(page);
+  await openSamples(page);
+  await expect(page.getByTestId('thumb-final')).toHaveAttribute('aria-selected', 'true');
+  const canvas = page.getByTestId('viewer-canvas');
+  await expect(canvas).toHaveAttribute('data-file', 'final');
+  await expect(page.getByTestId('look-status')).toContainText('preview in');
+  // Bright & airy: the median of the rendered frame sits well above mid-grey.
+  const median = await medianLuma(canvas);
+  expect(median, 'final look median luma').toBeGreaterThan(140);
+  await page.screenshot({ path: join(shotsDir, '13-final.png') });
+
+  // Before/after toggles the view.
+  await page.keyboard.press('b');
+  await expect(canvas).toHaveAttribute('data-file', 'merged');
+  await page.screenshot({ path: join(shotsDir, '14-before.png') });
+  await page.keyboard.press('b');
+  await expect(canvas).toHaveAttribute('data-file', 'final');
+
+  // A brightness change re-renders darker.
+  await page.getByTestId('look-brightness').fill('-0.5');
+  await expect(page.getByTestId('look-brightness-value')).toHaveText('−0.50');
+  await expect.poll(async () => medianLuma(canvas), { timeout: 30_000 }).toBeLessThan(median - 15);
+  await page.getByTestId('look-reset').click();
+
+  // Upright finds the camera tilt and is on by default; turning it off changes the frame.
+  await expect(page.getByTestId('inspector')).toContainText('camera tilted');
+  await expect(page.getByTestId('look-upright')).toBeChecked();
+  const straight = await canvas.evaluate((c: HTMLCanvasElement) => c.toDataURL());
+  await page.getByTestId('look-upright').uncheck();
+  await expect.poll(async () => canvas.evaluate((c: HTMLCanvasElement) => c.toDataURL()), { timeout: 30_000 }).not.toBe(straight);
+  await page.getByTestId('look-upright').check();
+
+  // Picking a white patch switches the white balance to custom.
+  await page.getByTestId('pick-white').click();
+  const box = (await canvas.boundingBox())!;
+  await page.mouse.click(box.x + box.width * 0.88, box.y + box.height * 0.2);
+  await expect(page.getByTestId('wb-auto')).toHaveAttribute('aria-pressed', 'false');
+
+  const download = page.waitForEvent('download');
+  await page.getByTestId('export-jpeg').click();
+  const file = await download;
+  expect(file.suggestedFilename()).toMatch(/-HDR\.jpg$/);
+  await file.saveAs(join(shotsDir, 'export.jpg'));
+  await expect(page.getByTestId('export-status')).toContainText('Exported');
+  expect(errors).toEqual([]);
+});
+
 test('arrow keys step through frames; histogram has a readout', async ({ page }) => {
   await openSamples(page);
   const title = page.getByTestId('inspector-title');
@@ -153,6 +255,7 @@ test('arrow keys step through frames; histogram has a readout', async ({ page })
   await page.keyboard.press('ArrowLeft');
   await expect(title).toHaveText(start ?? '');
 
+  await page.getByTestId('filmstrip').getByTestId('thumb').first().click();
   const chart = page.getByTestId('inspector').locator('.histogram svg');
   const box = (await chart.boundingBox())!;
   await page.mouse.move(box.x + box.width * 0.6, box.y + 20);
