@@ -2,9 +2,9 @@ node_modules/
 dist/
 .DS_Store
 
-# Sample brackets are ~67 MB per frame; keep them out of git.
-app-samples/*.ARW
-app-samples/*.arw
+# Sample brackets are ~67 MB per frame; keep them out of git (subfolders too).
+app-samples/**/*.ARW
+app-samples/**/*.arw
 
 # Playwright output
 test-results/

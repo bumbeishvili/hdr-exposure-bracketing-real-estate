@@ -1,21 +1,27 @@
-// Full-resolution rendering. The look is fused at a quarter of the sensor's
-// linear resolution (render.ts); this adds the finer octaves on the full-size
-// image, band by band. At each octave every synthetic exposure's detail is
-// weighted by that exposure's fusion weight at the octave and added to the
-// upsampled coarse fusion: Mertens' Laplacian-pyramid blend with the coarse
-// levels taken from the small render, so the export matches the preview at
-// every scale and gains the sensor's full detail. Geometry (lens distortion and
-// lateral chromatic aberration, Upright) is a single bicubic resampling from the
-// sensor image; vignetting is divided out at the sensor position.
+// Full-resolution rendering. The look is computed at a quarter of the sensor's
+// linear size (render.ts): the window pull, the local tone mapping and the
+// per-image numbers (wall level, exposure, black point, dehaze). This renders
+// the same look on the full-size image, band by band. The window pull is redone
+// per pixel at full resolution, from the glass edge the small render measured
+// (its distance, upsampled and scaled, and its blur at this scale). The
+// tone mapping comes across as a gain: the small render's log gain, upsampled by
+// a guided filter guided by the full-size luminance, so the gain's edges snap
+// to the sharp image edges (no halos) while fine detail passes through in linear
+// light (so the export averages back to exactly the small render). Colour and
+// finishing are then applied per pixel exactly as in the small render.
+// Geometry (lens distortion and lateral chromatic aberration, Upright) is a
+// single bicubic resampling from the sensor image; vignetting is divided out at
+// the sensor position.
 
-import { cameraToProPhoto, PROPHOTO_TO_SRGB, applyHueSatTable, type ColorTransform } from '../color/color.ts';
+import { cameraToProPhoto, type ColorTransform } from '../color/color.ts';
 import type { CfaImage } from '../demosaic/demosaic.ts';
 import { demosaicRect } from '../demosaic/demosaic.ts';
 import { RCD_BORDER } from '../demosaic/rcd.ts';
 import { knotValue } from '../geometry/lens.ts';
 import type { UprightWarp } from '../geometry/upright.ts';
-import { finish, type FinishParams } from './finish.ts';
-import { displayDecode, exposureCurve, FUSION_WEIGHTS, toRgba8 } from './render.ts';
+import type { FinishParams } from './finish.ts';
+import { guidedFilter } from '../tone/guided.ts';
+import { FAR, luminance, pullWindow, RADIUS, recoverPixel, toDisplay, toRgba8, viewShares, type LookScene } from './render.ts';
 
 /** Camera RGB rows of the sensor image at output scale. */
 export interface RowSource {
@@ -31,19 +37,25 @@ export interface DetailJob {
   height: number;
   /** Output pixels per base pixel: 2 or 4. */
   factor: number;
-  /** Rows [y0, y0 + rows) of the base render (its full size is width × height). */
-  base: { width: number; height: number; y0: number; rows: number; fused: Float32Array; center: Float32Array };
+  /** Rows [y0, y0 + rows) of the base render's maps (its full size is width × height; see LookBase). */
+  base: { width: number; height: number; y0: number; rows: number; gain: Float32Array; distance: Float32Array; blur: Float32Array; frame: Float32Array };
+  scene: LookScene;
   warp: UprightWarp;
   /** Relative illumination per knot, divided out; null leaves vignetting alone. */
   vignetting: Float64Array | null;
+  /** Camera level where the merge clipped (Infinity: nowhere); see recoverPixel. */
+  clip: number;
   transform: ColorTransform;
-  gain: number;
-  exposures: number[];
   finish: FinishParams;
 }
 
 /** Output rows per band; a multiple of every factor. */
-export const DETAIL_BAND = 64;
+export const DETAIL_BAND = 128;
+
+/** Extra rows a band reads: the reach of the gain's guided upsampling (the window pull is per pixel). */
+export function bandMargin(job: Pick<DetailJob, 'factor'>): number {
+  return job.factor * Math.ceil((2 * job.factor + 2) / job.factor);
+}
 
 /** Renders output rows [v0, v1) (v0 a multiple of the factor) to 8-bit sRGB RGBA. */
 export function renderRows(job: DetailJob, source: RowSource, v0: number, v1: number, onBand?: (rows: number) => void): Uint8ClampedArray {
@@ -56,140 +68,51 @@ export function renderRows(job: DetailJob, source: RowSource, v0: number, v1: nu
   return out;
 }
 
+/** Whether the base rows covering output rows [e0, e1) come within the bloom radius of glass. */
+function glassNear(job: DetailJob, e0: number, e1: number): boolean {
+  const { base, factor: F } = job;
+  if (!base.distance.length) return false;
+  const r0 = Math.max(base.y0, Math.floor(e0 / F) - 1);
+  const r1 = Math.min(base.y0 + base.rows, Math.ceil(e1 / F) + 1);
+  const reach = -(RADIUS.bloom * base.width + 2);
+  for (let i = (r0 - base.y0) * base.width; i < (r1 - base.y0) * base.width; i++) if (base.distance[i] > reach && base.distance[i] > -FAR) return true;
+  return false;
+}
+
 /** Display-referred linear sRGB for output rows [b0, b1). */
 function renderBand(job: DetailJob, source: RowSource, b0: number, b1: number): Float32Array {
-  const { width: W, height: H, factor: F } = job;
-  // The band plus a margin of one coarse group on each side, aligned to the coarsest grid.
-  const e0 = Math.max(0, b0 - F);
-  const e1 = Math.min(H, b1 + F);
+  const { width: W, height: H, factor: F, scene } = job;
+  // Rows around the band for the gain's guided filter.
+  const margin = bandMargin(job);
+  const e0 = Math.max(0, b0 - margin);
+  const e1 = Math.min(H, b1 + margin);
   const rows = e1 - e0;
-  const n = rows * W;
 
-  const linear = sampleCamera(job, source, e0, e1);
-  cameraToProPhoto(job.transform, linear);
-  for (let i = 0; i < linear.length; i++) linear[i] *= job.gain;
-  const center = upsampleBase(job, job.base.center, 1, e0, e1);
+  const { rgb: lin, clipped } = sampleCamera(job, source, e0, e1);
+  cameraToProPhoto(job.transform, lin);
+  const Y = luminance(lin);
+  // The window pull, in place on the pixels, from the base render's glass edge.
+  let pulled: Float32Array;
+  if (scene.pull > 0 && glassNear(job, e0, e1)) {
+    const at = (map: Float32Array, ch: number): Float32Array => upsampleBase(job, map, ch, e0, e1);
+    pullWindow(lin, at(job.base.distance, 1), at(job.base.blur, 1), at(job.base.frame, 3), scene.pull, clipped, F, W);
+    pulled = Float32Array.from(luminance(lin), Math.log2);
+  } else pulled = Float32Array.from(Y, Math.log2);
 
-  const images = job.exposures.map((ev) => {
-    const k = 2 ** ev;
-    const img = new Float32Array(n * 3);
-    for (let i = 0; i < img.length; i++) img[i] = linear[i] * k;
-    if (job.transform.lookTable) applyHueSatTable(job.transform.lookTable, img);
-    for (let i = 0; i < img.length; i++) img[i] = exposureCurve(img[i]);
-    return img;
-  });
-  const weights = images.map((img) => weightMap(img, W, rows, center));
-  for (let p = 0; p < n; p++) {
-    let sum = 1e-12;
-    for (const w of weights) sum += w[p];
-    for (const w of weights) w[p] /= sum;
-  }
-
-  // Coarse levels from the base render, then each finer octave's blended detail.
-  const fused = upsampleBase(job, job.base.fused, 3, b0, b1);
-  const m = (b1 - b0) * W;
+  // The tone mapping's gain, upsampled along the full-size image's own edges.
+  const gain = guidedFilter(pulled, upsampleBase(job, job.base.gain, 1, e0, e1), W, rows, F, 0.01);
   const at = (b0 - e0) * W;
-  images.forEach((img, k) => {
-    let lo: Float32Array = img.subarray(at * 3, (at + m) * 3);
-    for (let s = 1; s < F; s *= 2) {
-      const hi = blur(img, 3, W, e0, e1, 2 * s, b0, b1);
-      const w = s === 1 ? weights[k].subarray(at, at + m) : blur(weights[k], 1, W, e0, e1, s, b0, b1);
-      for (let p = 0; p < m; p++) {
-        const wp = w[p];
-        fused[3 * p] += wp * (lo[3 * p] - hi[3 * p]);
-        fused[3 * p + 1] += wp * (lo[3 * p + 1] - hi[3 * p + 1]);
-        fused[3 * p + 2] += wp * (lo[3 * p + 2] - hi[3 * p + 2]);
-      }
-      lo = hi;
-    }
-  });
-
-  const M = PROPHOTO_TO_SRGB;
-  const out = new Float32Array(m * 3);
+  const m = (b1 - b0) * W;
+  const tone = new Float32Array(m);
+  const l = new Float32Array(m);
   for (let p = 0; p < m; p++) {
-    const r = displayDecode(fused[3 * p]);
-    const g = displayDecode(fused[3 * p + 1]);
-    const b = displayDecode(fused[3 * p + 2]);
-    out[3 * p] = M[0] * r + M[1] * g + M[2] * b;
-    out[3 * p + 1] = M[3] * r + M[4] * g + M[5] * b;
-    out[3 * p + 2] = M[6] * r + M[7] * g + M[8] * b;
+    tone[p] = pulled[at + p] + gain[at + p];
+    l[p] = Math.log2(Y[at + p]);
   }
-  finish(out, job.finish);
+  const share = viewShares(l, pulled.subarray(at, at + m), scene.pull);
+  const out = new Float32Array(m * 3);
+  toDisplay(lin.subarray(at * 3, (at + m) * 3), pulled.subarray(at, at + m), tone, share, scene, job.transform, job.finish, out);
   return out;
-}
-
-/** Mertens weights at full resolution (as fusion.ts computes them), in the log domain. */
-function weightMap(img: Float32Array, w: number, h: number, center: Float32Array): Float32Array {
-  const n = w * h;
-  const grey = new Float32Array(n);
-  for (let p = 0; p < n; p++) grey[p] = 0.2126 * img[3 * p] + 0.7152 * img[3 * p + 1] + 0.0722 * img[3 * p + 2];
-  const q = FUSION_WEIGHTS;
-  const inv2s2 = q.exposedness / (2 * q.sigma * q.sigma);
-  const map = new Float32Array(n);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const p = y * w + x;
-      const r = img[3 * p];
-      const g = img[3 * p + 1];
-      const b = img[3 * p + 2];
-      const xm = x > 0 ? p - 1 : p + 1;
-      const xp = x < w - 1 ? p + 1 : p - 1;
-      const ym = y > 0 ? p - w : p + w;
-      const yp = y < h - 1 ? p + w : p - w;
-      const contrast = Math.abs(4 * grey[p] - grey[xm] - grey[xp] - grey[ym] - grey[yp]);
-      const mean = (r + g + b) / 3;
-      const saturation = Math.sqrt(((r - mean) ** 2 + (g - mean) ** 2 + (b - mean) ** 2) / 3);
-      const c = center[p];
-      map[p] = Math.exp(q.contrast * Math.log(contrast + 1e-3) + q.saturation * Math.log(saturation + 1e-3) - ((r - c) ** 2 + (g - c) ** 2 + (b - c) ** 2) * inv2s2);
-    }
-  }
-  return map;
-}
-
-/**
- * Low-pass at scale s, for output rows [b0, b1): the mean over s × s groups of
- * the global grid (`src` holds rows [e0, e1), e0 a multiple of s), bilinearly
- * interpolated between group centres.
- */
-function blur(src: Float32Array, ch: number, W: number, e0: number, e1: number, s: number, b0: number, b1: number): Float32Array {
-  const gy0 = e0 / s;
-  const gh = Math.ceil(e1 / s) - gy0;
-  const gw = Math.ceil(W / s);
-  const bins = new Float32Array(gh * gw * ch);
-  for (let gy = 0; gy < gh; gy++) {
-    const y0 = (gy0 + gy) * s;
-    const y1 = Math.min(y0 + s, e1);
-    const row = gy * gw * ch;
-    for (let y = y0; y < y1; y++) {
-      let o = (y - e0) * W * ch;
-      for (let gx = 0; gx < gw; gx++) {
-        const x1 = Math.min((gx + 1) * s, W);
-        const g = row + gx * ch;
-        if (ch === 3) {
-          let r = 0;
-          let gr = 0;
-          let b = 0;
-          for (let x = gx * s; x < x1; x++, o += 3) {
-            r += src[o];
-            gr += src[o + 1];
-            b += src[o + 2];
-          }
-          bins[g] += r;
-          bins[g + 1] += gr;
-          bins[g + 2] += b;
-        } else {
-          let a = 0;
-          for (let x = gx * s; x < x1; x++, o++) a += src[o];
-          bins[g] += a;
-        }
-      }
-    }
-    for (let gx = 0; gx < gw; gx++) {
-      const inv = 1 / ((y1 - y0) * (Math.min(W, (gx + 1) * s) - gx * s));
-      for (let c = 0; c < ch; c++) bins[row + gx * ch + c] *= inv;
-    }
-  }
-  return interpolate(bins, gw, gh, gy0, ch, W, s, b0, b1, 0, gh);
 }
 
 /**
@@ -300,7 +223,7 @@ function sensorPoint(warp: UprightWarp, u: number, v: number, c: number): [numbe
 }
 
 /** Camera RGB at output rows [e0, e1): bicubic samples of the sensor image through the warp, devignetted. */
-function sampleCamera(job: DetailJob, source: RowSource, e0: number, e1: number): Float32Array {
+function sampleCamera(job: DetailJob, source: RowSource, e0: number, e1: number): { rgb: Float32Array; clipped: Float32Array | null } {
   const { warp, width: W } = job;
   const [s0, s1] = sourceRowsFor(warp, e0, e1);
   const src = source.rows(s0, s1);
@@ -310,6 +233,8 @@ function sampleCamera(job: DetailJob, source: RowSource, e0: number, e1: number)
   const lens = warp.lens;
   const ca = !!lens && (!!lens.caRed || !!lens.caBlue);
   const vig = job.vignetting;
+  const clip = job.clip;
+  const neutral = job.transform.neutral;
   const cx = warp.sourceWidth / 2;
   const cy = warp.sourceHeight / 2;
   const invDiag = 1 / Math.hypot(cx, cy);
@@ -319,6 +244,7 @@ function sampleCamera(job: DetailJob, source: RowSource, e0: number, e1: number)
   const rowAt = new Int32Array(4);
   const colAt = new Int32Array(4);
   const out = new Float32Array((e1 - e0) * W * 3);
+  const clipped = clip < Infinity ? new Float32Array((e1 - e0) * W) : null;
   const sample = (x: number, y: number, c0: number, c1: number, o: number): void => {
     const xf = Math.floor(x);
     const yf = Math.floor(y);
@@ -358,6 +284,7 @@ function sampleCamera(job: DetailJob, source: RowSource, e0: number, e1: number)
         sample(xg, yg, 1, 2, o);
         sample(cx + xu * kb - 0.5, cy + yu * kb - 0.5, 2, 3, o);
       } else sample(xg, yg, 0, 3, o);
+      if (clipped) clipped[o / 3] = recoverPixel(out, o, neutral, clip);
       if (vig) {
         const g = 1 / knotValue(vig, Math.hypot(xg + 0.5 - cx, yg + 0.5 - cy) * invDiag);
         out[o] *= g;
@@ -366,21 +293,22 @@ function sampleCamera(job: DetailJob, source: RowSource, e0: number, e1: number)
       }
     }
   }
-  return out;
+  return { rgb: out, clipped };
 }
 
 /**
  * What rendering output rows [v0, v1) reads: CFA rows (with room for the
  * demosaic's border, starting on an even row) and base-render rows.
  */
-export function chunkInputs(job: Pick<DetailJob, 'warp' | 'factor' | 'height' | 'base'>, source: 'rcd' | 'bin', cfaHeight: number, v0: number, v1: number): { cfa: [number, number]; base: [number, number] } {
+export function chunkInputs(job: Pick<DetailJob, 'warp' | 'factor' | 'width' | 'height' | 'base'>, source: 'rcd' | 'bin', cfaHeight: number, v0: number, v1: number): { cfa: [number, number]; base: [number, number] } {
   const F = job.factor;
-  const [s0, s1] = sourceRowsFor(job.warp, Math.max(0, v0 - F), Math.min(job.height, v1 + F));
+  const margin = Math.max(F, bandMargin(job));
+  const [s0, s1] = sourceRowsFor(job.warp, Math.max(0, v0 - margin), Math.min(job.height, v1 + margin));
   const cfa: [number, number] =
     source === 'rcd'
       ? [Math.max(0, (s0 - RCD_BORDER - 2) & ~1), Math.min(cfaHeight, s1 + RCD_BORDER + 2)]
       : [Math.max(0, 2 * s0 - 2) & ~1, Math.min(cfaHeight, 2 * s1 + 2)];
-  const base: [number, number] = [Math.max(0, Math.floor(v0 / F) - 2), Math.min(job.base.height, Math.ceil(v1 / F) + 2)];
+  const base: [number, number] = [Math.max(0, Math.floor((v0 - margin) / F) - 2), Math.min(job.base.height, Math.ceil((v1 + margin) / F) + 2)];
   return { cfa, base };
 }
 

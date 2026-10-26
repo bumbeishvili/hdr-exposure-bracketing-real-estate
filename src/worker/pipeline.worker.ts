@@ -2,9 +2,10 @@
 // Decoded frames stay here; the UI receives metadata, statistics and previews.
 
 import { readArw, type RawFrame } from '../raw/arw.ts';
+import { splitBrackets } from '../analysis/brackets.ts';
 import { computeFrameStats } from '../analysis/stats.ts';
 import { analyzeExposures, linearLimit, type ExposureAnalysis } from '../analysis/exposure.ts';
-import { fitNoiseModel, type NoiseModel } from '../analysis/noise.ts';
+import { fitNoiseModel, nominalNoiseModel, type NoiseModel } from '../analysis/noise.ts';
 import { alignFrames, type AlignmentResult } from '../merge/align.ts';
 import { mergeFrames, type MergedImage } from '../merge/merge.ts';
 import { detectMotion, type MotionMasks } from '../merge/deghost.ts';
@@ -14,9 +15,9 @@ import { binMerged, type RgbImage } from '../merge/bin.ts';
 import { readDcp, type CameraProfile } from '../color/dcp.ts';
 import { colorTransform, neutralForTemperature, type Vec3 } from '../color/color.ts';
 import { estimateInteriorWhiteBalance, whiteBalanceFromPatch, withTemperature } from '../color/wb.ts';
-import { renderLook, toRgba8, type LookBase } from '../look/render.ts';
+import { classifyScene, defaultWhiteBalance, renderLook, sceneEv, toRgba8, type ClipLevel, type LookBase } from '../look/render.ts';
 import { chunkInputs, DETAIL_BAND, type DetailJob } from '../look/detail.ts';
-import { applyWarp, estimateUpright, geometryWarp } from '../geometry/upright.ts';
+import { applyWarp, estimateUpright, geometryWarp, vignettingGain } from '../geometry/upright.ts';
 import { devignette, knotValue, sonyLensModel, type LensModel } from '../geometry/lens.ts';
 import { writeDng } from '../raw/dng.ts';
 import { exifSegment, insertSegment, type ExifInfo } from '../raw/jpeg-exif.ts';
@@ -50,13 +51,14 @@ let uprightRotation: Matrix3 | null = null;
 let focal35 = 35;
 /** The lens's own corrections, from the base frame's maker notes. */
 let lensModel: LensModel | null = null;
-const corrected = new WeakMap<RgbImage, Map<string, RgbImage>>();
+const corrected = new WeakMap<RgbImage, Map<string, RgbImage & { clip: ClipLevel }>>();
 
 /** The working image as rendered: devignetted and resampled through the lens model and Upright when on. */
-function working(img: RgbImage, s: Pick<LookSettings, 'upright' | 'lens'>): RgbImage {
+function working(img: RgbImage, s: Pick<LookSettings, 'upright' | 'lens'>): RgbImage & { clip: ClipLevel } {
   const rotation = s.upright ? uprightRotation : null;
   const lens = s.lens ? lensModel : null;
-  if (!rotation && !lens) return img;
+  const level = merged?.clip ?? Infinity;
+  if (!rotation && !lens) return { ...img, clip: { level, gain: null } };
   const key = `${rotation ? 'u' : ''}${lens ? 'l' : ''}`;
   let cache = corrected.get(img);
   if (!cache) corrected.set(img, (cache = new Map()));
@@ -65,7 +67,9 @@ function working(img: RgbImage, s: Pick<LookSettings, 'upright' | 'lens'>): RgbI
     const rgb = lens ? Float32Array.from(img.rgb) : img.rgb;
     if (lens) devignette(rgb, img.width, img.height, lens);
     const warp = geometryWarp(rotation, lens, img.width, img.height, (focal35 / 36) * img.width);
-    out = { width: warp.width, height: warp.height, rgb: applyWarp(rgb, img.width, img.height, warp) };
+    // Devignetting raised the corners: the clip level there rose with it.
+    const gain = lens?.vignetting ? vignettingGain(warp, lens.vignetting) : null;
+    out = { width: warp.width, height: warp.height, rgb: applyWarp(rgb, img.width, img.height, warp), clip: { level, gain } };
     cache.set(key, out);
   }
   return out;
@@ -107,28 +111,28 @@ async function renderPendingLook(): Promise<void> {
     const neutral = neutralForTemperature(profile, settings.wb.temperature, settings.wb.tint);
     const key = JSON.stringify(settings);
     let image: { width: number; height: number; rgba: Uint8ClampedArray };
-    let exposures: number[];
+    let pull: number;
     let windowShare = 0;
     let detail = req.detail;
     if (detail === 'sharp' && displayBase?.key === key) {
       // Half resolution with full-resolution detail, on the render workers; the pipeline thread stays free for previews.
       image = await renderDetailed(merged, displayBase.base, settings, profile, neutral, 'half', () => {});
-      exposures = displayBase.base.exposures;
+      pull = displayBase.base.scene.pull;
     } else {
       const display = detail !== 'preview';
       if (display) detail = 'display'; // a sharp render needs this one first
       if (display) lookExport ??= binMerged(merged, 2);
-      const { width, height, rgb } = working(display ? lookExport! : lookPreview, settings);
-      const out = renderLook(rgb, width, height, profile, { ...settings, neutral }, display);
+      const { width, height, rgb, clip } = working(display ? lookExport! : lookPreview, settings);
+      const out = renderLook(rgb, width, height, profile, { ...settings, neutral }, display, clip);
       // The display render is also the base of sharp renders and exports with the same settings.
       if (display && out.base) displayBase = { key, base: out.base };
       image = { width, height, rgba: new Uint8ClampedArray(width * height * 4) };
       toRgba8(out.rgb, image.rgba);
-      exposures = out.exposures;
+      pull = out.pull;
       windowShare = out.windowShare;
     }
     post(
-      { type: 'look', id: req.id, detail, ...image, exposures, windowShare, sizes: exportSizes(settings), ms: performance.now() - t0 },
+      { type: 'look', id: req.id, detail, ...image, pull, windowShare, sizes: exportSizes(settings), ms: performance.now() - t0 },
       [image.rgba.buffer],
     );
   } catch (err) {
@@ -163,7 +167,7 @@ async function exportJpeg(id: number, settings: LookSettings, size: ExportSize):
     } else {
       lookExport ??= binMerged(merged, 2);
       const work = working(lookExport, settings);
-      const look = renderLook(work.rgb, work.width, work.height, profile, { ...settings, neutral }, size !== 'small');
+      const look = renderLook(work.rgb, work.width, work.height, profile, { ...settings, neutral }, size !== 'small', work.clip);
       if (size === 'small' || !look.base) {
         image = { width: work.width, height: work.height, rgba: new Uint8ClampedArray(work.width * work.height * 4) };
         toRgba8(look.rgb, image.rgba);
@@ -202,15 +206,15 @@ async function renderDetailed(m: MergedImage, base: LookBase, settings: LookSett
     width,
     height,
     factor,
-    base: { width: base.width, height: base.height, y0: 0, rows: base.height, fused: base.fused, center: base.center },
+    base: { width: base.width, height: base.height, y0: 0, rows: base.height, gain: base.gain, distance: base.distance, blur: base.blur, frame: base.frame },
+    scene: base.scene,
     warp:
       rotation || lens
         ? geometryWarp(rotation, lens, sensorWidth, sensorHeight, (focal35 / 36) * sensorWidth, { width, height })
         : { inverse: [1, 0, 0, 0, 1, 0, 0, 0, 1], width, height, sourceWidth: sensorWidth, sourceHeight: sensorHeight, scale: 1, lens: null },
     vignetting: lens?.vignetting ?? null,
+    clip: m.clip,
     transform: colorTransform(profile, neutral),
-    gain: base.gain,
-    exposures: base.exposures,
     finish: { contrast: settings.contrast, vibrance: settings.vibrance, cleanWhites: settings.cleanWhites },
   };
   const wb: [number, number, number] = [neutral[1] / neutral[0], 1, neutral[1] / neutral[2]];
@@ -230,19 +234,22 @@ async function renderDetailed(m: MergedImage, base: LookBase, settings: LookSett
       const need = chunkInputs(job, source, m.height, v0, v1);
       const data = m.data.slice(need.cfa[0] * m.width, need.cfa[1] * m.width);
       const [b0, b1] = need.base;
-      const fused = base.fused.slice(b0 * base.width * 3, b1 * base.width * 3);
-      const center = base.center.slice(b0 * base.width, b1 * base.width);
+      const rows = (map: Float32Array, ch = 1): Float32Array => map.slice(ch * b0 * base.width, ch * b1 * base.width);
+      const gain = rows(base.gain);
+      const distance = rows(base.distance);
+      const blur = rows(base.blur);
+      const frame = rows(base.frame, 3);
       return {
         chunk: {
           id: i,
-          job: { ...job, base: { width: base.width, height: base.height, y0: b0, rows: b1 - b0, fused, center } },
+          job: { ...job, base: { width: base.width, height: base.height, y0: b0, rows: b1 - b0, gain, distance, blur, frame } },
           cfa: { width: m.width, height: need.cfa[1] - need.cfa[0], data, cfaColors: m.cfaColors, referenceRange: m.referenceRange, offset: need.cfa[0] },
           source,
           wb,
           v0,
           v1,
         },
-        transfer: [data.buffer, fused.buffer, center.buffer],
+        transfer: [data.buffer, gain.buffer, distance.buffer, blur.buffer, frame.buffer],
       };
     },
     (i, part) => rgba.set(part, chunks[i][0] * width * 4),
@@ -289,7 +296,7 @@ async function exportDng(id: number, settings: LookSettings): Promise<void> {
     const neutral = neutralForTemperature(profile, settings.wb.temperature, settings.wb.tint);
     // The embedded preview shows the finished look in the raw data's own geometry.
     const work = working(lookPreview, { upright: false, lens: false });
-    const look = renderLook(work.rgb, work.width, work.height, profile, { ...settings, neutral });
+    const look = renderLook(work.rgb, work.width, work.height, profile, { ...settings, neutral }, false, work.clip);
     const rgba = new Uint8ClampedArray(work.width * work.height * 4);
     toRgba8(look.rgb, rgba);
     const rgb = new Uint8Array(work.width * work.height * 3);
@@ -370,7 +377,6 @@ function lensInfo(model: LensModel | null, lensName: string, width: number, heig
 async function prepareLook(reference: RawFrame): Promise<void> {
   if (!merged) return;
   lookPreview = binMerged(merged, 4);
-  lookExport = null;
   displayBase = null;
   const profile = await loadProfile();
   const auto = estimateInteriorWhiteBalance(profile, lookPreview.rgb);
@@ -378,23 +384,34 @@ async function prepareLook(reference: RawFrame): Promise<void> {
   const cameraLevels = reference.sr2?.tags.get(0x7312);
   const camera = cameraLevels?.length === 4 ? withTemperature(profile, neutralFromLevels(cameraLevels), 0) : null;
   const setting = (w: { temperature: number; tint: number }): WbSetting => ({ temperature: w.temperature, tint: w.tint });
+  // Interior or exterior, from the metered exposure, the walls and the sky; it decides the default look.
+  const lum = new Float32Array(lookPreview.width * lookPreview.height);
+  for (let i = 0; i < lum.length; i++) lum[i] = 0.25 * lookPreview.rgb[3 * i] + 0.5 * lookPreview.rgb[3 * i + 1] + 0.25 * lookPreview.rgb[3 * i + 2];
+  const scene = classifyScene(sceneEv(reference.exposure), auto.coverage, lum, lookPreview.width, lookPreview.height);
 
-  // Upright, estimated once on the preview image's luminance, with lens distortion already undone.
+  // Upright, estimated once at a quarter of the sensor's linear size with lens distortion already
+  // undone (the undistorted crop is a little smaller than the frame; the focal length is unchanged).
   lensModel = sonyLensModel(reference.lensCorrection);
   focal35 = reference.exposure.focalLength35mm > 0 ? reference.exposure.focalLength35mm : reference.exposure.focalLength || 35;
-  const { width, height } = lookPreview;
+  lookExport = binMerged(merged, 2);
+  const { width, height } = lookExport;
   const focal = (focal35 / 36) * width;
-  const rgb = lensModel ? applyWarp(lookPreview.rgb, width, height, geometryWarp(null, lensModel, width, height, focal)) : lookPreview.rgb;
-  const lum = new Float32Array(width * height);
-  for (let i = 0; i < lum.length; i++) lum[i] = 0.25 * rgb[3 * i] + 0.5 * rgb[3 * i + 1] + 0.25 * rgb[3 * i + 2];
-  const upright = estimateUpright(lum, width, height, focal);
+  let straight: RgbImage = lookExport;
+  if (lensModel) {
+    const warp = geometryWarp(null, lensModel, width, height, focal);
+    straight = { width: warp.width, height: warp.height, rgb: applyWarp(lookExport.rgb, width, height, warp) };
+  }
+  const straightLum = new Float32Array(straight.width * straight.height);
+  for (let i = 0; i < straightLum.length; i++) straightLum[i] = 0.25 * straight.rgb[3 * i] + 0.5 * straight.rgb[3 * i + 1] + 0.25 * straight.rgb[3 * i + 2];
+  const upright = estimateUpright(straightLum, straight.width, straight.height, focal);
   uprightRotation = upright.rotation;
   const keep = upright.rotation ? geometryWarp(upright.rotation, lensModel, width, height, focal).scale : 1;
 
   post({
     type: 'look-ready',
     profile: `${profile.name} (${profile.cameraModel.replace(/^Sony /, '')})`,
-    wb: { auto: { ...setting(auto), coverage: auto.coverage }, asShot: setting(asShot), camera: camera ? setting(camera) : null },
+    wb: { auto: { ...setting(auto), coverage: auto.coverage }, asShot: setting(asShot), camera: camera ? setting(camera) : null, default: defaultWhiteBalance(scene, auto, camera) },
+    scene,
     upright: { available: !!upright.rotation, pitch: upright.pitch, roll: upright.roll, lines: upright.lines.length, keep },
     lens: lensInfo(lensModel, reference.exposure.lensModel, merged.width, merged.height),
   });
@@ -502,7 +519,17 @@ async function open(files: File[]): Promise<void> {
     }
   }
 
-  if (frames.length >= 2) {
+  // Several brackets in the selection: the largest (the first of equals) is merged, and the UI offers the others.
+  const groups = splitBrackets(frames.map((f) => f.frame));
+  if (groups.length > 1) {
+    let chosen = 0;
+    for (let g = 1; g < groups.length; g++) if (groups[g].length > groups[chosen].length) chosen = g;
+    post({ type: 'brackets', groups: groups.map((g) => g.map((i) => frames[i].index)), chosen });
+    frames = groups[chosen].map((i) => frames[i]);
+  }
+
+  // One frame is rendered as it is (no merge partner); two or more are merged.
+  if (frames.length >= 1) {
     const t0 = performance.now();
     post({ type: 'progress', index: files.length, total: files.length, fileName: '', stage: 'measuring' });
     const raw = frames.map((f) => f.frame);
@@ -517,7 +544,10 @@ async function open(files: File[]): Promise<void> {
       post({ type: 'exposures-error', message: errorText(err) });
     }
     let noise: NoiseModel | undefined;
-    if (analysis) {
+    if (analysis && raw.length === 1) {
+      noise = nominalNoiseModel(raw, analysis);
+      post({ type: 'noise-error', message: 'Measuring noise needs two frames of a bracket; a single frame uses typical sensor values.' });
+    } else if (analysis) {
       const t1 = performance.now();
       post({ type: 'progress', index: files.length, total: files.length, fileName: '', stage: 'noise' });
       try {

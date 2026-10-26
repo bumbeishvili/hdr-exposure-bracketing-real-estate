@@ -5,8 +5,9 @@
 // w_i = e_i² / Var(v_i), where Var uses the signal predicted from the best frame
 // rather than the frame's own noisy sample (that would bias bright noise low).
 // Weights roll off smoothly towards clipping so no frame switches off abruptly,
-// which is what leaves seams. Shifted frames are resampled per colour plane
-// with a Catmull-Rom kernel.
+// which is what leaves seams, and alike for the four samples of a Bayer quad
+// (from its brightest), so a pixel's colours always come from the same frames.
+// Shifted frames are resampled per colour plane with a Catmull-Rom kernel.
 
 import { cfaIndex, type RawFrame } from '../raw/arw.ts';
 import type { ExposureAnalysis } from '../analysis/exposure.ts';
@@ -41,6 +42,8 @@ export interface MergedImage {
   cfaColors: number[];
   /** The reference frame's white − black: 1.0 on the preview scale. */
   referenceRange: number;
+  /** Preview-scale level where the darkest frame clips: samples there were clipped in every frame. */
+  clip: number;
 }
 
 export interface MergeResult {
@@ -66,8 +69,6 @@ interface Source {
   height: number;
   black: number[];
   clipCode: number;
-  rollLo: number[];
-  rollHi: number[];
   exposure: number;
   shot: number;
   resample: boolean;
@@ -118,8 +119,6 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
         height: f.height,
         black: f.blackLevel,
         clipCode: f.whiteLevel,
-        rollLo: f.blackLevel.map((b) => b + rollStart * (f.whiteLevel - b)),
-        rollHi: f.blackLevel.map((b) => b + rollEnd * (f.whiteLevel - b)),
         exposure: 2 ** exposures.frames[i].measuredEv,
         shot: shotFactor(noise, f.exposure.exposureTime),
         resample,
@@ -153,123 +152,132 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
   let clippedSamples = 0;
   let maxSignal = 0;
 
-  const raws = new Float64Array(nS);
-  const xs = new Float64Array(nS);
-  const ws = new Float64Array(nS);
-  const tapClip = new Uint8Array(nS);
+  // Per frame, the radiance estimates of a Bayer quad's four samples and the quad's weight factor.
+  const xs = new Float64Array(4 * nS);
+  const part = new Float64Array(nS);
 
   const motion = opts.motion ?? null;
-  const rowWeights = motion ? sources.map(() => new Float32Array(motion.cols)) : null;
+  // Motion weights of the quad's two rows, per frame, along the block columns.
+  const rowWeights = motion ? [0, 1].map(() => sources.map(() => new Float32Array(motion.cols))) : null;
+  const motionAt = (k: number, row: number, x: number): number => {
+    if (!motion || !rowWeights) return 1;
+    const fx = Math.min(Math.max(x / motion.block - 0.5, 0), motion.cols - 1);
+    const x0 = Math.min(fx | 0, motion.cols - 2);
+    const tx = fx - x0;
+    const rw = rowWeights[row][k];
+    return rw[x0] * (1 - tx) + rw[x0 + 1] * tx;
+  };
 
-  for (let y = 0; y < H; y++) {
+  for (let y = 0; y < H; y += 2) {
     if (motion && rowWeights) {
-      const fy = Math.min(Math.max(y / motion.block - 0.5, 0), motion.rows - 1);
-      const y0 = Math.min(Math.floor(fy), motion.rows - 2);
-      const ty = fy - y0;
-      sources.forEach((src, k) => {
-        const w = motion.weights[src.index];
-        const out = rowWeights[k];
-        for (let bx = 0; bx < motion.cols; bx++) out[bx] = w[y0 * motion.cols + bx] * (1 - ty) + w[(y0 + 1) * motion.cols + bx] * ty;
-      });
+      for (let row = 0; row < 2; row++) {
+        const fy = Math.min(Math.max((y + row) / motion.block - 0.5, 0), motion.rows - 1);
+        const y0 = Math.min(Math.floor(fy), motion.rows - 2);
+        const ty = fy - y0;
+        sources.forEach((src, k) => {
+          const w = motion.weights[src.index];
+          const out = rowWeights[row][k];
+          for (let bx = 0; bx < motion.cols; bx++) out[bx] = w[y0 * motion.cols + bx] * (1 - ty) + w[(y0 + 1) * motion.cols + bx] * ty;
+        });
+      }
     }
-    const Y = crop.top + y;
-    const py = Y & 1;
-    const V = Y >> 1;
     const prow = Math.floor((y >> 1) / pf);
     const inPreviewY = prow < ph;
-    for (let x = 0; x < W; x++) {
-      const X = crop.left + x;
-      const px = X & 1;
-      const p = (py << 1) | px;
-      const U = X >> 1;
-
-      // Samples, brightest frame first, until the best frame is found and the rest are too dark to matter.
+    for (let x = 0; x < W; x += 2) {
+      // The quad's samples, brightest frame first, until the best frame is found and the rest are too dark to
+      // matter. A frame weighs alike in all four samples of a quad — its roll-off from the quad's brightest sample —
+      // so a pixel's colours come from the same frames as each other (where green clips before red and blue in a
+      // frame, a subject that moved would otherwise leave green and magenta fringes).
       let best = -1;
       let used = 0;
       for (let k = 0; k < nS; k++) {
         const s = sources[k];
         if (best >= 0 && s.exposure < sources[best].exposure * minRel) break;
-        let v: number;
+        let peak = 0;
         let clipped = false;
-        if (!s.resample) {
-          v = s.cfa[Y * s.width + X];
-          clipped = v >= s.clipCode;
-        } else {
-          v = 0;
-          const pwMax = (s.width >> 1) - 1;
-          const phMax = (s.height >> 1) - 1;
-          for (let j = 0; j < 4; j++) {
-            let vv = V + s.iy - 1 + j;
-            vv = vv < 0 ? 0 : vv > phMax ? phMax : vv;
-            const row = (2 * vv + py) * s.width + px;
-            let acc = 0;
-            for (let i = 0; i < 4; i++) {
-              let uu = U + s.ix - 1 + i;
-              uu = uu < 0 ? 0 : uu > pwMax ? pwMax : uu;
-              const t = s.cfa[row + 2 * uu];
-              if (t >= s.clipCode) clipped = true;
-              acc += s.wx[i] * t;
+        for (let q = 0; q < 4; q++) {
+          const yy = y + (q >> 1);
+          const xx = x + (q & 1);
+          if (yy >= H || xx >= W) continue;
+          const Y = crop.top + yy;
+          const X = crop.left + xx;
+          const py = Y & 1;
+          const px = X & 1;
+          const p = (py << 1) | px;
+          let v: number;
+          if (!s.resample) {
+            v = s.cfa[Y * s.width + X];
+            if (v >= s.clipCode) clipped = true;
+          } else {
+            v = 0;
+            const V = Y >> 1;
+            const U = X >> 1;
+            const pwMax = (s.width >> 1) - 1;
+            const phMax = (s.height >> 1) - 1;
+            for (let j = 0; j < 4; j++) {
+              let vv = V + s.iy - 1 + j;
+              vv = vv < 0 ? 0 : vv > phMax ? phMax : vv;
+              const row = (2 * vv + py) * s.width + px;
+              let acc = 0;
+              for (let i = 0; i < 4; i++) {
+                let uu = U + s.ix - 1 + i;
+                uu = uu < 0 ? 0 : uu > pwMax ? pwMax : uu;
+                const t = s.cfa[row + 2 * uu];
+                if (t >= s.clipCode) clipped = true;
+                acc += s.wx[i] * t;
+              }
+              v += s.wy[j] * acc;
             }
-            v += s.wy[j] * acc;
           }
+          xs[4 * k + q] = (v - s.black[p]) / s.exposure;
+          peak = Math.max(peak, (v - s.black[p]) / (s.clipCode - s.black[p]));
         }
-        raws[k] = v;
-        xs[k] = (v - s.black[p]) / s.exposure;
-        tapClip[k] = clipped ? 1 : 0;
+        if (clipped || peak >= rollEnd) part[k] = 0;
+        else if (peak > rollStart) {
+          const t = (peak - rollStart) / (rollEnd - rollStart);
+          part[k] = 1 - t * t * (3 - 2 * t);
+        } else part[k] = 1;
         used = k + 1;
-        if (best < 0 && !clipped && v < s.rollLo[p]) best = k;
+        if (best < 0 && part[k] === 1) best = k;
       }
 
-      // Predicted signal for the variances: from the best frame, else the darkest sample.
-      const xHat = Math.max(xs[best >= 0 ? best : used - 1], 0);
-      const ch = noise.channels[p];
-      let sw = 0;
-      let swx = 0;
-      for (let k = 0; k < used; k++) {
-        const s = sources[k];
-        const v = raws[k];
-        ws[k] = 0;
-        if (tapClip[k] || v >= s.rollHi[p]) continue;
-        const e = s.exposure;
-        let w = (e * e) / ((ch.alpha * s.shot * xHat * e + ch.beta) * s.varFactor);
-        const lo = s.rollLo[p];
-        if (v > lo) {
-          const t = (v - lo) / (s.rollHi[p] - lo);
-          w *= 1 - t * t * (3 - 2 * t);
+      for (let q = 0; q < 4; q++) {
+        const yy = y + (q >> 1);
+        const xx = x + (q & 1);
+        if (yy >= H || xx >= W) continue;
+        const p = (((crop.top + yy) & 1) << 1) | ((crop.left + xx) & 1);
+        // Predicted signal for the variances: from the best frame, else the darkest sample.
+        const xHat = Math.max(xs[4 * (best >= 0 ? best : used - 1) + q], 0);
+        const ch = noise.channels[p];
+        const pcol = Math.floor((xx >> 1) / pf);
+        const inPreview = inPreviewY && pcol < pw;
+        let sw = 0;
+        let swx = 0;
+        for (let k = 0; k < used; k++) {
+          if (!part[k]) continue;
+          const s = sources[k];
+          const e = s.exposure;
+          const w = ((e * e) / ((ch.alpha * s.shot * xHat * e + ch.beta) * s.varFactor)) * part[k] * motionAt(k, q >> 1, xx);
+          sw += w;
+          swx += w * xs[4 * k + q];
+          if (inPreview) pWeight[(prow * pw + pcol) * nS + k] += w;
         }
-        if (rowWeights && motion) {
-          const fx = Math.min(Math.max(x / motion.block - 0.5, 0), motion.cols - 1);
-          const x0 = Math.min(fx | 0, motion.cols - 2);
-          const tx = fx - x0;
-          const rw = rowWeights[k];
-          w *= rw[x0] * (1 - tx) + rw[x0 + 1] * tx;
-        }
-        ws[k] = w;
-        sw += w;
-        swx += w * xs[k];
-        if (inPreviewY) {
-          const pcol = Math.floor((x >> 1) / pf);
-          if (pcol < pw) pWeight[(prow * pw + pcol) * nS + k] += w;
-        }
-      }
 
-      let value: number;
-      const idx = y * W + x;
-      if (sw > 0) {
-        value = swx / sw;
-        variance[idx] = 1 / sw;
-      } else {
-        // Every frame clipped: keep the darkest frame's value as a lower bound.
-        value = xs[used - 1];
-        variance[idx] = Infinity;
-        clippedSamples++;
-      }
-      data[idx] = value;
-      if (value > maxSignal) maxSignal = value;
+        let value: number;
+        const idx = yy * W + xx;
+        if (sw > 0) {
+          value = swx / sw;
+          variance[idx] = 1 / sw;
+        } else {
+          // Every frame clipped: keep the darkest frame's value as a lower bound.
+          value = xs[4 * (used - 1) + q];
+          variance[idx] = Infinity;
+          clippedSamples++;
+        }
+        data[idx] = value;
+        if (value > maxSignal) maxSignal = value;
 
-      if (inPreviewY) {
-        const pcol = Math.floor((x >> 1) / pf);
-        if (pcol < pw) {
+        if (inPreview) {
           const o = prow * pw + pcol;
           pSum[o * 3 + cfaColors[p]] += value / referenceRange;
           if (sw <= 0) pClip[o] |= 1 << cfaColors[p];
@@ -316,9 +324,11 @@ export function mergeFrames(frames: RawFrame[], exposures: ExposureAnalysis, noi
   }
 
   const brightest = sources[0];
+  const darkest = sources[nS - 1];
   const floor = Math.sqrt(Math.min(...noise.channels.map((c) => c.beta))) / brightest.exposure;
+  const clip = (darkest.clipCode - Math.max(...darkest.black)) / darkest.exposure / referenceRange;
   return {
-    image: { width: W, height: H, data, variance, cfaColors, referenceRange },
+    image: { width: W, height: H, data, variance, cfaColors, referenceRange, clip },
     preview: { width: pw, height: ph, rgb, clip: pClip },
     sourceMap,
     weightShare,

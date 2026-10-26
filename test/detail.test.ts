@@ -1,7 +1,8 @@
 // Full-resolution export on a synthetic room with a bright window: the render
-// must match the quarter-size look it is built on when scaled down, carry the
-// fine detail that look lacks, and come out the same whether rendered in one
-// pass or in chunks from row slices (as the render-worker pool does).
+// must match the quarter-size look it is built on when scaled down (window pull
+// included), carry the fine detail that look lacks, and come out the same
+// whether rendered in one pass or in chunks from row slices (as the
+// render-worker pool does).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,26 +24,30 @@ const COLORS = [0, 1, 1, 2];
 const RANGE = 15871;
 const NEUTRAL: Vec3 = [0.45, 1, 0.7];
 
-/** Camera RGB (1 = white) of a room: textured walls and floor, fine stripes, a window up to 5× white. */
+/**
+ * Camera RGB (1 = white) of a room: walls with gentle shading, a fabric-like
+ * floor texture, fine stripes (±10%, a few pixels apart), and a window up to
+ * 4× white with a mullion.
+ */
 function scene(x: number, y: number): [number, number, number] {
   const window = x > 300 && x < 460 && y > 60 && y < 240;
   if (window) {
-    const sky = 3 + 2 * Math.sin(x / 9) * Math.cos(y / 13);
+    const sky = 3 * (1 + 0.2 * Math.sin(x / 9) * Math.cos(y / 13));
     const bar = Math.abs(x - 380) < 3 ? 0.08 : 1; // a mullion
     return [sky * 0.42 * bar, sky * bar, sky * 0.75 * bar];
   }
-  const wall = 0.12 + 0.02 * Math.sin(x / 31) + (y > 280 ? 0.04 * Math.sin(x * 1.3) * Math.sin(y * 0.9) : 0);
-  const stripes = x > 60 && x < 160 && y > 100 && y < 220 ? 0.06 * Math.sign(Math.sin(x * 1.1)) : 0;
-  return [(wall + stripes) * 0.5, wall + stripes, (wall + stripes) * 0.72];
+  const wall = 0.12 * (1 + 0.15 * Math.sin(x / 31)) * (y > 280 ? 1 + 0.12 * Math.sin(x * 1.3) * Math.sin(y * 0.9) : 1);
+  const stripes = x > 60 && x < 160 && y > 100 && y < 220 ? 1 + 0.1 * Math.sign(Math.sin(x * 1.1)) : 1;
+  return [wall * stripes * 0.5, wall * stripes, wall * stripes * 0.72];
 }
 
 function merged(): MergedImage {
   const data = new Float32Array(W * H);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) data[y * W + x] = scene(x + 0.5, y + 0.5)[COLORS[((y & 1) << 1) | (x & 1)]] * RANGE;
-  return { width: W, height: H, data, variance: new Float32Array(0), cfaColors: COLORS, referenceRange: RANGE };
+  return { width: W, height: H, data, variance: new Float32Array(0), cfaColors: COLORS, referenceRange: RANGE, clip: Infinity };
 }
 
-const look = { ...REAL_ESTATE_LOOK, neutral: NEUTRAL };
+const look = { ...REAL_ESTATE_LOOK, neutral: NEUTRAL, scene: 'interior' as const };
 const wb: [number, number, number] = [NEUTRAL[1] / NEUTRAL[0], 1, NEUTRAL[1] / NEUTRAL[2]];
 
 /** The quarter-size look and the full-resolution job built on it, as the pipeline worker builds them. */
@@ -70,12 +75,12 @@ function setup(rotation: Matrix3 | null, lensOn: boolean): { img: MergedImage; s
     width,
     height,
     factor: 4,
-    base: { width: base.width, height: base.height, y0: 0, rows: base.height, fused: base.fused, center: base.center },
+    base: { width: base.width, height: base.height, y0: 0, rows: base.height, gain: base.gain, distance: base.distance, blur: base.blur, frame: base.frame },
+    scene: base.scene,
     warp,
     vignetting: lens?.vignetting ?? null,
+    clip: img.clip,
     transform: colorTransform(profile, NEUTRAL),
-    gain: base.gain,
-    exposures: base.exposures,
     finish: look,
   };
   return { img, small, base, job };
@@ -88,8 +93,9 @@ function chunked(img: MergedImage, base: LookBase, job: DetailJob, step: number)
     const v1 = Math.min(job.height, v0 + step);
     const need = chunkInputs(job, 'rcd', img.height, v0, v1);
     const [b0, b1] = need.base;
+    const rows = (map: Float32Array, ch = 1): Float32Array => map.slice(ch * b0 * base.width, ch * b1 * base.width);
     const part = renderRows(
-      { ...job, base: { width: base.width, height: base.height, y0: b0, rows: b1 - b0, fused: base.fused.slice(b0 * base.width * 3, b1 * base.width * 3), center: base.center.slice(b0 * base.width, b1 * base.width) } },
+      { ...job, base: { width: base.width, height: base.height, y0: b0, rows: b1 - b0, gain: rows(base.gain), distance: rows(base.distance), blur: rows(base.blur), frame: rows(base.frame, 3) } },
       demosaicSource({ width: W, height: need.cfa[1] - need.cfa[0], data: img.data.slice(need.cfa[0] * W, need.cfa[1] * W), cfaColors: COLORS, referenceRange: RANGE, offset: need.cfa[0] }, wb),
       v0,
       v1,
@@ -145,7 +151,7 @@ test('the full-resolution render matches the look it is built on and adds the fi
   const stripesUp = fineDetail(up, W, 70, 110, 150, 210);
   assert.ok(stripesFull > 3 * stripesUp, `fine detail ${stripesFull.toFixed(1)} vs upsampled ${stripesUp.toFixed(1)}`);
 
-  // The mullion in the window stays dark and narrow: no halo from the coarse fusion.
+  // The mullion in the window stays dark and narrow: no halo from the window pull or the tone mapping.
   const row = 150 * W;
   const mullion = full[(row + 380) * 4 + 1];
   const sky = Math.min(full[(row + 365) * 4 + 1], full[(row + 395) * 4 + 1]);

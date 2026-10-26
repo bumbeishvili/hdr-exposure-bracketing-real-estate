@@ -38,7 +38,7 @@ function mosaic(scene: Scene): { img: MergedImage; truth: Float32Array } {
       data[y * W + x] = rgb[COLORS[((y & 1) << 1) | (x & 1)]];
     }
   }
-  return { img: { width: W, height: H, data, variance: new Float32Array(0), cfaColors: COLORS, referenceRange: 1 }, truth };
+  return { img: { width: W, height: H, data, variance: new Float32Array(0), cfaColors: COLORS, referenceRange: 1, clip: Infinity }, truth };
 }
 
 function psnr(img: MergedImage, truth: Float32Array, algorithm: DemosaicAlgorithm, margin = 4): number {

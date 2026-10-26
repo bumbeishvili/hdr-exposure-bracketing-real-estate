@@ -1,8 +1,9 @@
 // Real-estate finishing on display-referred linear sRGB, in Oklab so hue holds
 // while lightness and chroma change. Clean whites takes the cast out of bright
-// near-neutrals (walls, ceilings, trim); vibrance lifts muted colours and leaves
-// near-neutrals alone; contrast is an S-curve on lightness that adds the "pop"
-// fused images lack. Out-of-gamut colours are pulled towards grey, not clipped.
+// near-neutrals (walls, ceilings, trim), towards the slightly warm white of
+// walls in professional interiors; vibrance lifts muted colours and leaves
+// near-neutrals alone; contrast is an S-curve on lightness. Out-of-gamut
+// colours are pulled towards grey, not clipped.
 
 export interface FinishParams {
   /** −1…1: S-curve strength on lightness. */
@@ -12,6 +13,9 @@ export interface FinishParams {
   /** 0…1: how much of a cast is removed from bright near-neutrals. */
   cleanWhites: number;
 }
+
+/** The white clean whites steers towards, in Oklab: slightly warm (L*a*b* about +0.5, +2), as walls in professional interiors measure. */
+const WHITE = { a: 0.002, b: 0.008 } as const;
 
 const smoothstep = (a: number, b: number, x: number): number => {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -37,11 +41,16 @@ export function finish(rgb: Float32Array, p: FinishParams): void {
       L = x + 2 * p.contrast * x * (1 - x) * (2 * x - 1);
     }
     const C = Math.sqrt(A * A + B * B);
-    let scale = 1;
-    if (p.cleanWhites > 0) scale *= 1 - p.cleanWhites * smoothstep(0.62, 0.92, L) * (1 - smoothstep(0.02, 0.09, C));
-    if (p.vibrance) scale *= 1 + p.vibrance * (1 - smoothstep(0, 0.22, C)) * smoothstep(0.012, 0.05, C);
-    A *= scale;
-    B *= scale;
+    if (p.cleanWhites > 0) {
+      const clean = p.cleanWhites * smoothstep(0.62, 0.92, L) * (1 - smoothstep(0.02, 0.09, C));
+      A = WHITE.a + (A - WHITE.a) * (1 - clean);
+      B = WHITE.b + (B - WHITE.b) * (1 - clean);
+    }
+    if (p.vibrance) {
+      const scale = 1 + p.vibrance * (1 - smoothstep(0, 0.22, C)) * smoothstep(0.012, 0.05, C);
+      A *= scale;
+      B *= scale;
+    }
 
     // Oklab → linear sRGB.
     const l1 = L + 0.3963377774 * A + 0.2158037573 * B;

@@ -8,6 +8,7 @@ import type { SeamReport } from '../merge/seams.ts';
 import type { DemosaicAlgorithm, Rect } from '../demosaic/demosaic.ts';
 import type { PreviewData } from '../analysis/preview.ts';
 import type { FrameStats } from '../analysis/stats.ts';
+import type { SceneKind } from '../look/render.ts';
 
 /** A decoded frame without its pixel data (which stays in the worker). */
 export type FrameInfo = Omit<RawFrame, 'cfa' | 'sr2'> & {
@@ -41,6 +42,14 @@ export interface WbSetting {
   tint: number;
 }
 
+/** White balance candidates: from the walls (auto), as shot, and the camera's own auto measurement. */
+export interface LookWb {
+  auto: WbSetting & { coverage: number };
+  asShot: WbSetting;
+  camera: WbSetting | null;
+  default: WbPreset;
+}
+
 /** User-facing look settings; the worker turns `wb` into a camera neutral with the camera profile. */
 export interface LookSettings {
   wb: WbSetting;
@@ -49,11 +58,18 @@ export interface LookSettings {
   contrast: number;
   vibrance: number;
   cleanWhites: number;
+  /** Midtone contrast from the local tone mapping. */
+  clarity: number;
   /** Straighten verticals (camera pitch and roll). */
   upright: boolean;
   /** Apply the lens's own corrections (vignetting, distortion, lateral CA). */
   lens: boolean;
+  /** Interior (windows pulled, exposure from the walls) or exterior (the camera's exposure). */
+  scene: SceneKind;
 }
+
+/** Which white balance candidate the look starts from. */
+export type WbPreset = 'auto' | 'asShot' | 'camera';
 
 /** The lens corrections the camera recorded, summarised for the UI. */
 export interface LensInfo {
@@ -106,6 +122,8 @@ export type WorkerEvent =
   | { type: 'progress'; index: number; total: number; fileName: string; stage: 'reading' | 'decoding' | 'measuring' | 'noise' | 'aligning' | 'deghosting' | 'merging' }
   | { type: 'frame'; index: number; info: FrameInfo; stats: FrameStats; preview: PreviewData; ms: number }
   | { type: 'frame-error'; index: number; fileName: string; message: string }
+  /** The selection holds several brackets (file indices, in the order shot): only `chosen` is merged. */
+  | { type: 'brackets'; groups: number[][]; chosen: number }
   /** `analysis` indexes frames by position in `indices`, which maps back to file indices. */
   | { type: 'exposures'; indices: number[]; analysis: ExposureAnalysis; ms: number }
   | { type: 'exposures-error'; message: string }
@@ -118,10 +136,11 @@ export type WorkerEvent =
   /** `rgb` is interleaved camera RGB for `rect` (1.0 = the reference white level). */
   | { type: 'crop'; id: number; rect: Rect; algorithm: DemosaicAlgorithm; rgb: Float32Array; ms: number }
   | { type: 'crop-error'; id: number; message: string }
-  /** The look stage is ready: white balance candidates, and the camera profile in use. */
-  | { type: 'look-ready'; profile: string; wb: { auto: WbSetting & { coverage: number }; asShot: WbSetting; camera: WbSetting | null }; upright: UprightInfo; lens: LensInfo }
+  /** The look stage is ready: white balance candidates (and the one to start from), the scene kind, and the camera profile in use. */
+  | { type: 'look-ready'; profile: string; wb: LookWb; scene: SceneKind; upright: UprightInfo; lens: LensInfo }
   /** `sizes`: pixel size of each export size under these settings. */
-  | { type: 'look'; id: number; detail: LookDetail; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; windowShare: number; sizes: Record<ExportSize, [number, number]>; ms: number }
+  /** `pull`: stops the view through the windows was darkened by; `windowShare`: its share of the frame. */
+  | { type: 'look'; id: number; detail: LookDetail; width: number; height: number; rgba: Uint8ClampedArray; pull: number; windowShare: number; sizes: Record<ExportSize, [number, number]>; ms: number }
   | { type: 'export-progress'; id: number; fraction: number }
   | { type: 'export'; id: number; format: 'jpeg' | 'dng'; blob: Blob; width: number; height: number; ms: number }
   | { type: 'neutral-picked'; wb: WbSetting }

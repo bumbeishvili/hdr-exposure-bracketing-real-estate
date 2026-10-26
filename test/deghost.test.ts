@@ -14,16 +14,19 @@ import { detectMotion } from '../src/merge/deghost.ts';
 const W = 640;
 const H = 448;
 
-/** Textured background; a bright 60 × 90 px "person" with its left edge at `subjectX` (or none). */
-function frame(exposure: number, seq: number, subjectX: number | null, seed: number): RawFrame {
+/**
+ * Textured background (`level` on average); a 60 × 90 px "person" of radiance `subject` with its left edge at
+ * `subjectX` (or none).
+ */
+function frame(exposure: number, seq: number, subjectX: number | null, seed: number, level = 70, subject = 260): RawFrame {
   let s = seed;
   const rand = (): number => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32);
   const gauss = (): number => Math.sqrt(-2 * Math.log(rand() + 1e-12)) * Math.cos(2 * Math.PI * rand());
   const cfa = new Uint16Array(W * H);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
-      let scene = 60 + 40 * Math.sin(x / 23) * Math.cos(y / 31) + 20 * ((x >> 4) & 1);
-      if (subjectX !== null && x >= subjectX && x < subjectX + 60 && y >= 180 && y < 270) scene = 260;
+      let scene = (level / 70) * (60 + 40 * Math.sin(x / 23) * Math.cos(y / 31) + 20 * ((x >> 4) & 1));
+      if (subjectX !== null && x >= subjectX && x < subjectX + 60 && y >= 180 && y < 270) scene = subject;
       const sig = scene * exposure;
       cfa[y * W + x] = Math.min(16383, Math.max(0, Math.round(512 + sig + gauss() * Math.sqrt(0.25 * sig + 2))));
     }
@@ -84,4 +87,27 @@ test('a moving subject comes from the base frame only', () => {
   // With deghosting: background at x = 400, subject at x = 100 — both from the base frame.
   assert.ok(Math.abs(boxMean(clean, 400) - background) < 40, `no ghost: ${boxMean(clean, 400)}`);
   assert.ok(Math.abs(boxMean(clean, 100) - subject) < 20, `subject kept: ${boxMean(clean, 100)}`);
+});
+
+test('a dark subject seen where a longer frame clipped around it leaves no ghost and no colour fringe', () => {
+  // A bright lawn the long frame clips; a dark person at x = 100 in the base and short frames, at x = 400 in the
+  // long one — where only the person, not the lawn around it, is below clipping.
+  const level = 1100;
+  const frames = [frame(4, 1, 100, 21, level, 100), frame(1, 2, 100, 22, level, 100), frame(16, 3, 400, 23, level, 100)];
+  const exposures = analyzeExposures(frames, frames.map((f) => computeFrameStats(f).meanSignal));
+  const noise = fitNoiseModel(frames, exposures, { stride: 1 });
+  const alignment = alignFrames(frames, exposures, noise);
+  const motion = detectMotion(frames, exposures, noise, alignment);
+  assert.ok(motion.share[2] > 0.005, `the long frame is flagged where it saw the person (${motion.share[2]})`);
+  const data = mergeFrames(frames, exposures, noise, alignment, { motion }).image.data;
+  // At x = 400: the lawn, in all three colours alike (RGGB: red at even rows and columns, blue at odd ones).
+  const lawn = (level / 70) * 70 * 4;
+  const colour = (dy: number, dx: number): number => {
+    let sum = 0;
+    let n = 0;
+    for (let y = 190 + dy; y < 260; y += 2) for (let x = 408 + dx; x < 452; x += 2) (sum += data[y * W + x]), n++;
+    return sum / n;
+  };
+  const [red, green, blue] = [colour(0, 0), colour(0, 1), colour(1, 1)];
+  for (const [name, v] of [['red', red], ['green', green], ['blue', blue]] as const) assert.ok(Math.abs(v - lawn) < 0.05 * lawn, `${name} ${v.toFixed(0)}, lawn ${lawn.toFixed(0)}`);
 });

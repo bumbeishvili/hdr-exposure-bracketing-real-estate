@@ -7,7 +7,8 @@ import type { ExposureAnalysis, FrameExposure, PairRatio } from '../analysis/exp
 import type { NoiseModel } from '../analysis/noise.ts';
 import type { PreviewData } from '../analysis/preview.ts';
 import type { FrameStats } from '../analysis/stats.ts';
-import type { ExportSize, FrameInfo, LensInfo, LookDetail, LookSettings, MergeSummary, UprightInfo, WbSetting, WorkerEvent, WorkerRequest } from '../worker/protocol.ts';
+import type { ExportSize, FrameInfo, LensInfo, LookDetail, LookSettings, LookWb, MergeSummary, UprightInfo, WbSetting, WorkerEvent, WorkerRequest } from '../worker/protocol.ts';
+import type { SceneKind } from '../look/render.ts';
 import type { DemosaicAlgorithm, Rect } from '../demosaic/demosaic.ts';
 import { REAL_ESTATE_LOOK } from '../look/defaults.ts';
 import { h, replace, s as svg } from './dom.ts';
@@ -138,10 +139,10 @@ class App {
   private crop: { id: number; rect: Rect; algorithm: DemosaicAlgorithm; data: PreviewData; ms: number } | null = null;
   private cropRequest = 0;
   /** The finished real-estate look. */
-  private lookInfo: { profile: string; wb: { auto: WbSetting & { coverage: number }; asShot: WbSetting; camera: WbSetting | null }; upright: UprightInfo; lens: LensInfo } | null = null;
+  private lookInfo: { profile: string; wb: LookWb; scene: SceneKind; upright: UprightInfo; lens: LensInfo } | null = null;
   private lookSettings: LookSettings | null = null;
   private wbMode: WbMode = 'auto';
-  private lookImage: { id: number; detail: LookDetail; width: number; height: number; rgba: Uint8ClampedArray; exposures: number[]; sizes: Record<ExportSize, [number, number]>; ms: number } | null = null;
+  private lookImage: { id: number; detail: LookDetail; width: number; height: number; rgba: Uint8ClampedArray; pull: number; windowShare: number; sizes: Record<ExportSize, [number, number]>; ms: number } | null = null;
   private lookRequest = 0;
   private lookTimer = 0;
   private lookError = '';
@@ -179,6 +180,11 @@ class App {
   private readonly simpleCanvas = h('canvas', { class: 'simple-canvas pending', 'data-testid': 'simple-canvas', role: 'img', 'aria-label': 'The finished photo' });
   private readonly simpleProgress = h('div', { class: 'simple-progress', hidden: true }, h('span'));
   private readonly simpleMessage = h('p', { class: 'simple-message', role: 'status' });
+  private readonly simpleBrackets = h('p', { class: 'simple-brackets', 'data-testid': 'brackets' });
+  /** The last selection's brackets when it held several (one is shown; the others are offered), and which is shown. */
+  private brackets: File[][] = [];
+  private bracketShown = 0;
+  private selection: File[] = [];
   private readonly downloadButton = h('button', { type: 'button', class: 'icon-button download', 'aria-label': 'Download the full-resolution JPEG', title: 'Download (full resolution JPEG)', 'data-testid': 'download', hidden: true });
   private readonly advancedButton = h('button', { type: 'button', class: 'icon-button advanced-toggle', 'aria-label': 'Show the workspace', title: 'Details and controls', 'data-testid': 'advanced-toggle', hidden: true }, icon(...ICON_ADVANCED));
 
@@ -204,12 +210,16 @@ class App {
 
   // ---- loading -------------------------------------------------------------
 
-  private open(files: File[]): void {
+  /** Opens a selection of files; `bracket`: the shown one of the brackets a selection held (see `brackets`). */
+  private open(files: File[], bracket?: number): void {
     const arw = files.filter((f) => /\.arw$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
     if (!arw.length) {
       this.renderStatus('No .ARW files in that selection');
       return;
     }
+    if (bracket === undefined) this.brackets = [];
+    this.bracketShown = bracket ?? 0;
+    this.selection = arw;
     this.worker?.terminate();
     this.worker = new Worker(new URL('../worker/pipeline.worker.ts', import.meta.url), { type: 'module' });
     this.worker.onmessage = (e: MessageEvent<WorkerEvent>) => this.onWorkerEvent(e.data);
@@ -277,6 +287,12 @@ class App {
         this.renderSimple();
         break;
       }
+      case 'brackets': {
+        // Start over with that bracket's files alone, so that all shown is of one scene.
+        this.brackets = ev.groups.map((g) => g.map((i) => this.selection[i]));
+        this.open(this.brackets[ev.chosen], ev.chosen);
+        return;
+      }
       case 'frame-error':
         this.slots[ev.index].error = ev.message;
         this.renderAll();
@@ -329,10 +345,10 @@ class App {
         break;
       case 'look-ready': {
         const remerged = !!this.lookSettings; // a re-merge keeps the look the user has set
-        this.lookInfo = { profile: ev.profile, wb: ev.wb, upright: ev.upright, lens: ev.lens };
+        this.lookInfo = { profile: ev.profile, wb: ev.wb, scene: ev.scene, upright: ev.upright, lens: ev.lens };
         if (!remerged) {
           this.lookSettings = this.defaultLook();
-          this.wbMode = 'auto';
+          this.wbMode = ev.wb.default;
           this.selected = FINAL;
         }
         this.requestLook(0);
@@ -342,7 +358,7 @@ class App {
       case 'look':
         if (!this.lookImage || ev.id >= this.lookImage.id) {
           const first = !this.lookImage;
-          this.lookImage = { id: ev.id, detail: ev.detail, width: ev.width, height: ev.height, rgba: ev.rgba, exposures: ev.exposures, sizes: ev.sizes, ms: ev.ms };
+          this.lookImage = { id: ev.id, detail: ev.detail, width: ev.width, height: ev.height, rgba: ev.rgba, pull: ev.pull, windowShare: ev.windowShare, sizes: ev.sizes, ms: ev.ms };
           this.lookError = '';
           if (first) this.renderToolbar(); // enables Export
           else this.refreshExportSizes();
@@ -401,7 +417,7 @@ class App {
         this.totalMs = performance.now() - this.startedAt;
         const ok = this.slots.filter((s) => s.info).length;
         const failed = this.slots.length - ok;
-        const what = this.merge ? `${ok} frames decoded and merged` : `${ok} frame${ok === 1 ? '' : 's'} decoded`;
+        const what = this.merge ? (ok === 1 ? '1 frame decoded and rendered' : `${ok} frames decoded and merged`) : `${ok} frame${ok === 1 ? '' : 's'} decoded`;
         this.renderStatus(`${what} in ${(this.totalMs / 1000).toFixed(1)} s${failed ? ` · ${failed} failed` : ''}`);
         this.renderSummary();
         this.renderSimple();
@@ -443,7 +459,7 @@ class App {
       this.exportLook('jpeg');
     });
     this.advancedButton.addEventListener('click', () => this.setAdvanced(true));
-    replace(this.simple, this.simpleProgress, h('figure', { class: 'simple-figure' }, this.simpleCanvas, this.downloadButton), this.simpleMessage);
+    replace(this.simple, this.simpleProgress, h('figure', { class: 'simple-figure' }, this.simpleCanvas, this.downloadButton), this.simpleBrackets, this.simpleMessage);
     replace(this.root, this.input, header, h('main', {}, this.empty, this.workspace), this.simple, this.advancedButton);
     this.root.dataset.mode = 'simple';
   }
@@ -502,6 +518,16 @@ class App {
     const justDone = performance.now() - this.exportDone < 1800;
     replace(this.downloadButton, this.exportBusy ? progressRing(this.exportProgress) : icon(...(justDone ? ICON_DONE : ICON_DOWNLOAD)));
     this.simpleMessage.textContent = failed ? `Could not merge these files: ${failed}` : this.exportStatus.startsWith('Export failed') ? this.exportStatus : '';
+    const range = (g: File[]): string => (g.length > 1 ? `${stem(g[0].name)}–${stem(g[g.length - 1].name)}` : stem(g[0].name));
+    replace(
+      this.simpleBrackets,
+      ...(this.brackets.length > 1
+        ? [
+            `${this.brackets.length} brackets in these files; this is ${range(this.brackets[this.bracketShown])}.`,
+            ...this.brackets.map((g, k) => (k === this.bracketShown ? null : h('button', { type: 'button', class: 'link-button', onclick: () => this.open(g, k) }, `Show ${range(g)}`))),
+          ]
+        : []),
+    );
   }
 
   private renderStatus(text: string, progress?: number): void {
@@ -723,7 +749,8 @@ class App {
   /** The real-estate default look for this image. */
   private defaultLook(): LookSettings {
     const info = this.lookInfo!;
-    return { ...REAL_ESTATE_LOOK, wb: { temperature: info.wb.auto.temperature, tint: info.wb.auto.tint }, upright: info.upright.available, lens: info.lens.available };
+    const wb = info.wb[info.wb.default] ?? info.wb.asShot;
+    return { ...REAL_ESTATE_LOOK, wb: { temperature: wb.temperature, tint: wb.tint }, scene: info.scene, upright: info.upright.available, lens: info.lens.available };
   }
 
   /** Upright and lens corrections change the crop: keep the size menu's labels current without rebuilding it. */
@@ -757,7 +784,9 @@ class App {
         ? 'Rendering…'
         : pending
           ? 'Updating…'
-          : `${this.lookImage.width} × ${this.lookImage.height} ${this.lookImage.detail} in ${Math.round(this.lookImage.ms)} ms · fused ${this.lookImage.exposures.length} synthetic exposures`;
+          : `${this.lookImage.width} × ${this.lookImage.height} ${this.lookImage.detail} in ${Math.round(this.lookImage.ms)} ms${
+              this.lookImage.pull > 0 ? ` · window view pulled ${this.lookImage.pull.toFixed(1)} stops` : ''
+            }`;
   }
 
   private renderAll(): void {
@@ -1285,7 +1314,8 @@ class App {
     const setMode = (mode: WbMode): void => {
       this.wbMode = mode;
       for (const [m, b] of wbButtons) b.setAttribute('aria-pressed', String(m === mode));
-      wbNote.textContent = mode === 'auto' ? `walls neutral · ${pct(info.wb.auto.coverage)} of the room` : mode === 'custom' ? 'custom' : 'camera preset';
+      wbNote.textContent =
+        mode === 'auto' ? `walls neutral · ${pct(info.wb.auto.coverage)} of the room` : mode === 'camera' ? "the camera's auto measurement" : mode === 'asShot' ? 'as shot' : 'custom';
     };
     const row = (label: string, testId: string, min: number, max: number, step: number, value: number, format: (v: number) => string, onInput: (v: number) => void): HTMLElement => {
       const out = h('output', { class: 'look-value', 'data-testid': `${testId}-value` }, format(value));
@@ -1325,6 +1355,23 @@ class App {
     }
     const s = current();
     const signed2 = (v: number): string => fmt.signed(v, 2);
+    const sceneButtons = (['interior', 'exterior'] as const).map((kind) =>
+      h(
+        'button',
+        {
+          type: 'button',
+          'aria-pressed': String(s.scene === kind),
+          'data-testid': `scene-${kind}`,
+          onclick: () => {
+            if (current().scene === kind) return;
+            this.lookSettings = { ...current(), scene: kind };
+            this.requestLook(0);
+            this.renderInspector();
+          },
+        },
+        kind === 'interior' ? 'Interior' : 'Exterior',
+      ),
+    );
     const toggle = (label: string, testId: string, checked: boolean, disabled: boolean, onChange: (on: boolean) => void, note?: string): HTMLElement => {
       const box = h('input', { type: 'checkbox', checked, disabled, 'data-testid': testId });
       box.addEventListener('change', () => onChange(box.checked));
@@ -1333,7 +1380,9 @@ class App {
     replace(
       this.inspector,
       h('div', { class: 'inspector-head' }, h('h2', { 'data-testid': 'inspector-title' }, 'Final'), h('span', { class: 'badge' }, 'Real estate')),
-      h('p', { class: 'meta-line' }, `${info.profile} colour · bright & airy tone`),
+      h('p', { class: 'meta-line' }, `${info.profile} colour · ${s.scene === 'interior' ? 'bright & airy, windows pulled' : "the camera's exposure, sky and shadows balanced"}`),
+      h('h3', {}, 'Scene', h('span', { class: 'h3-note' }, s.scene === info.scene ? 'detected' : 'set by you')),
+      h('div', { class: 'segmented wide', role: 'group', 'aria-label': 'Scene' }, ...sceneButtons),
       h('h3', {}, 'White balance', wbNote),
       h('div', { class: 'segmented wide', role: 'group', 'aria-label': 'White balance' }, ...wbButtons.values()),
       row('Temp', 'look-temp', 0, 1000, 1, tempToSlider(s.wb.temperature), (v) => `${Math.round(sliderToTemp(v))} K`, (v) => {
@@ -1346,7 +1395,8 @@ class App {
       }),
       h('h3', {}, 'Tone'),
       row('Brightness', 'look-brightness', -1, 1.5, 0.05, s.brightness, signed2, (v) => apply({ brightness: v })),
-      row('Window pull', 'look-window', 0, 1, 0.05, s.windowPull, pct, (v) => apply({ windowPull: v })),
+      s.scene === 'interior' ? row('Window pull', 'look-window', 0, 1, 0.05, s.windowPull, pct, (v) => apply({ windowPull: v })) : null,
+      row('Clarity', 'look-clarity', 0, 1, 0.05, s.clarity, pct, (v) => apply({ clarity: v })),
       row('Contrast', 'look-contrast', -0.5, 0.6, 0.05, s.contrast, signed2, (v) => apply({ contrast: v })),
       h('h3', {}, 'Colour'),
       row('Vibrance', 'look-vibrance', -0.5, 0.6, 0.05, s.vibrance, signed2, (v) => apply({ vibrance: v })),
@@ -1365,7 +1415,7 @@ class App {
             'data-testid': 'look-reset',
             onclick: () => {
               this.lookSettings = this.defaultLook();
-              this.wbMode = 'auto';
+              this.wbMode = info.wb.default;
               this.requestLook(0);
               this.renderInspector();
             },

@@ -94,6 +94,24 @@ interface Row {
   w: number;
 }
 
+/**
+ * A nominal model for when there is nothing to fit (a single frame): typical
+ * values for a recent full-frame Sony sensor — about 4 e⁻/DN and 1.4 DN of read
+ * noise at base ISO — scaled with ISO. Enough to weight one frame; not a measurement.
+ */
+export function nominalNoiseModel(frames: RawFrame[], exposures: ExposureAnalysis): NoiseModel {
+  const ref = frames[exposures.reference];
+  const iso = ref.exposure.iso > 0 ? ref.exposure.iso : 100;
+  const alpha = 0.25 * (iso / 100);
+  const beta = 2 * Math.max(1, iso / 800);
+  return {
+    channels: channelNames(ref.cfaPattern.colors).map((name) => ({ name, alpha, beta })),
+    timeSlope: 0,
+    referenceTime: ref.exposure.exposureTime,
+    pairs: [],
+  };
+}
+
 export function fitNoiseModel(frames: RawFrame[], exposures: ExposureAnalysis, opts: NoiseOptions = {}): NoiseModel {
   const stride = opts.stride ?? 2;
   const perBin = opts.perBin ?? 4000;
